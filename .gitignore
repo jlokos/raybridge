@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.tsbuildinfo
+req/
+ray-query.sqlite
+
+# Debug artifacts
+*.log
+*.pid
+shim-test-results.json
+test-audit/

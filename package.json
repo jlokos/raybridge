@@ -1,0 +1,44 @@
+{
+  "name": "raybridge",
+  "version": "1.0.0",
+  "description": "MCP server exposing Raycast extension tools to Claude Code",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "raybridge": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "start:http": "MCP_HTTP=true bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "dev:http": "MCP_HTTP=true bun --watch src/index.ts",
+    "config": "bun run src/cli.ts",
+    "test:shims": "bun run src/test-shims.ts",
+    "start:bg": "nohup bun run start:http > raybridge.log 2>&1 & echo $! > raybridge.pid && tail -f raybridge.log"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@opentui/core": "^0.1.74",
+    "@opentui/react": "^0.1.74",
+    "@raycast/api": "^1.104.3",
+    "express": "^5.0.1",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.3"
+  },
+  "license": "MIT",
+  "author": "Justin Lokos",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jlokos/raybridge.git"
+  },
+  "homepage": "https://github.com/jlokos/raybridge#readme",
+  "bugs": {
+    "url": "https://github.com/jlokos/raybridge/issues"
+  },
+  "keywords": ["mcp", "raycast", "claude", "claude-code", "model-context-protocol"]
+}
