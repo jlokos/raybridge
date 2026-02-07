@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { getRaycastExtensionsDir } from "./raycast-paths.js";
 
 export interface ToolEntry {
   name: string;
@@ -22,7 +22,7 @@ export interface ExtensionEntry {
 }
 
 export async function discoverExtensions(): Promise<ExtensionEntry[]> {
-  const extensionsDir = join(homedir(), ".config", "raycast", "extensions");
+  const extensionsDir = getRaycastExtensionsDir();
   const entries: ExtensionEntry[] = [];
 
   let dirs: string[];

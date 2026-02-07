@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { TokenSet } from "./auth.js";
+import { getRaycastDataDir } from "./raycast-paths.js";
 
 const require = createRequire(import.meta.url);
 
@@ -133,10 +134,7 @@ const environmentDescriptor = {
         ? join(currentExtensionDir, "assets")
         : "",
       supportPath: join(
-        homedir(),
-        "Library",
-        "Application Support",
-        "com.raycast.macos",
+        getRaycastDataDir(),
         "extensions",
         currentExtension || "mcp-bridge"
       ),
@@ -244,6 +242,12 @@ function getPreferenceValues<T = Record<string, unknown>>(): T {
 async function getApplications() {
   const { readdirSync, existsSync } = await import("node:fs");
   const apps: Array<{ name: string; path: string; bundleId?: string }> = [];
+
+  if (process.platform === "win32") {
+    // Raycast tools typically don't need this on Windows; return empty list.
+    return apps;
+  }
+
   const appDirs = ["/Applications", `${homedir()}/Applications`];
   for (const dir of appDirs) {
     if (!existsSync(dir)) continue;

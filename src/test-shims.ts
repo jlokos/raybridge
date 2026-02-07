@@ -259,8 +259,8 @@ async function main() {
   setPreferences(prefs);
 
   try {
-    const tokens = loadRaycastTokens();
-    setRaycastTokens(tokens);
+  const tokens = await loadRaycastTokens();
+  setRaycastTokens(tokens);
   } catch {
     console.log("⚠️  Could not load OAuth tokens\n");
   }

@@ -192,7 +192,7 @@ export function createMcpServer(ctx: ServerContext): Server {
       const isAuthError =
         /token|oauth|unauthorized|403|401|invalid_grant|Missing required parameter: code/i.test(msg);
       const text = isAuthError
-        ? `OAuth error for ${extName}/${args.tool_name}: ${msg}\n\nThis extension requires OAuth authentication managed by Raycast. The tokens are stored in Raycast's encrypted database and cannot be accessed externally.\n\nWorkaround: If this extension supports personal access tokens, add them to ~/.config/raybridge/preferences.json:\n{\n  "${extName}": { "personalAccessToken": "your-token-here" }\n}`
+        ? `OAuth error for ${extName}/${args.tool_name}: ${msg}\n\nThis extension requires OAuth authentication managed by Raycast. The tokens are stored in Raycast's encrypted database and cannot be accessed externally.\n\nWorkaround: If this extension supports personal access tokens, add them to ${join(homedir(), ".config", "raybridge", "preferences.json")}:\n{\n  "${extName}": { "personalAccessToken": "your-token-here" }\n}`
         : `Error: ${msg}`;
       return {
         content: [{ type: "text" as const, text }],
@@ -240,7 +240,7 @@ export async function loadServerContext(): Promise<ServerContext> {
   // Manual prefs override Raycast prefs
   let mergedPrefs = { ...manualPrefs };
   try {
-    const raycastPrefs = loadRaycastPreferences();
+    const raycastPrefs = await loadRaycastPreferences();
     for (const [extName, extPrefs] of Object.entries(raycastPrefs)) {
       mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
     }
@@ -257,7 +257,7 @@ export async function loadServerContext(): Promise<ServerContext> {
 
   // Load OAuth tokens from Raycast's encrypted database
   try {
-    const raycastTokens = loadRaycastTokens();
+    const raycastTokens = await loadRaycastTokens();
     setRaycastTokens(raycastTokens);
     console.error(
       `raybridge: Loaded OAuth tokens for ${raycastTokens.size} extensions`
@@ -297,7 +297,7 @@ export async function reloadServerContext(ctx: ServerContext): Promise<boolean> 
   // Reload preferences from Raycast DB
   let mergedPrefs = { ...manualPrefs };
   try {
-    const raycastPrefs = loadRaycastPreferences();
+    const raycastPrefs = await loadRaycastPreferences();
     for (const [extName, extPrefs] of Object.entries(raycastPrefs)) {
       mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
     }
@@ -314,7 +314,7 @@ export async function reloadServerContext(ctx: ServerContext): Promise<boolean> 
 
   // Reload OAuth tokens from Raycast DB
   try {
-    const raycastTokens = loadRaycastTokens();
+    const raycastTokens = await loadRaycastTokens();
     setRaycastTokens(raycastTokens);
     console.error(
       `raybridge: Reloaded OAuth tokens for ${raycastTokens.size} extensions`

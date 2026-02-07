@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Windows support (Raycast extensions under `~/.config/raycast-x/extensions/`, Raycast DBs under `%LOCALAPPDATA%\\Raycast`)
+- Windows OAuth: auto-installs a pinned SQLite3MultipleCiphers (`sqlite3mc`) shell build for decrypting Raycast's DBs (no MSYS2 required)
+- `sqlcipher` resolver improvements (Windows auto-install, non-Windows env-based download overrides)
+
 ## v1.0.0
 
 Initial release.

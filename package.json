@@ -14,6 +14,7 @@
     "dev:http": "MCP_HTTP=true bun --watch src/index.ts",
     "config": "bun run src/cli.ts",
     "test:shims": "bun run src/test-shims.ts",
+    "debug:auth": "bun run src/debug-auth.ts",
     "start:bg": "nohup bun run start:http > raybridge.log 2>&1 & echo $! > raybridge.pid && tail -f raybridge.log"
   },
   "dependencies": {

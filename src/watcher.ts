@@ -2,6 +2,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { getRaycastDataDir, getRaycastExtensionsDir } from "./raycast-paths.js";
 
 export interface WatcherOptions {
   onReload: () => Promise<boolean>; // Returns true if tools changed
@@ -14,8 +15,8 @@ export function startExtensionWatcher(options: WatcherOptions): FSWatcher[] {
   const home = homedir();
 
   // Paths to watch
-  const extensionsDir = join(home, ".config", "raycast", "extensions");
-  const raycastSupportDir = join(home, "Library", "Application Support", "com.raycast.macos");
+  const extensionsDir = getRaycastExtensionsDir();
+  const raycastSupportDir = getRaycastDataDir();
   const raybridgeConfigDir = join(home, ".config", "raybridge");
   const rayAiToolsConfigDir = join(home, ".config", "ray-ai-tools");
 
@@ -68,7 +69,8 @@ export function startExtensionWatcher(options: WatcherOptions): FSWatcher[] {
   try {
     const extWatcher = watch(extensionsDir, { recursive: true }, (_event, filename) => {
       // Only trigger on relevant files
-      if (filename && !filename.endsWith("package.json") && !filename.includes("/tools/")) {
+      const normalized = filename ? filename.replace(/\\\\/g, "/") : "";
+      if (filename && !normalized.endsWith("package.json") && !normalized.includes("/tools/")) {
         return;
       }
       debouncedReload(filename || "extensions");
