@@ -236,6 +236,7 @@ if ($null -eq $blob) { exit 2 }
 
 function getWindowsKeyCandidates(): KeyCandidate[] {
   const candidates: KeyCandidate[] = [];
+  const debug = process.env.RAYBRIDGE_DEBUG_DB_OPEN === "1";
 
   const add = (label: string, keyPragma: SqlcipherKeyPragma, keyExpr: string) => {
     candidates.push({ label, keyPragma, keyExpr });
@@ -244,6 +245,25 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     add(label, "key", sqlStringLiteral(passphrase));
   const addHexkey = (label: string, hex: string) =>
     add(label, "hexkey", sqlStringLiteral(hex.toLowerCase()));
+
+  const addFromHexBasic = (label: string, hex: string) => {
+    const h = hex.toLowerCase();
+    if (!h) return;
+
+    // Interpret the hex string as a normal passphrase string.
+    addKey(`${label}:key(passphrase-hex)`, h);
+
+    // Interpret the underlying bytes as the passphrase (binary key).
+    addHexkey(`${label}:hexkey(binary-passphrase)`, h);
+
+    // Interpret as raw key material (no KDF). Only meaningful for 32-byte key (64 hex chars)
+    // or 32-byte key + 16-byte salt (96 hex chars).
+    if (h.length === 64 || h.length === 96) {
+      addKey(`${label}:key(raw-x)`, `x'${h}'`);
+      add(`${label}:key(raw-x:double-quoted)`, "key", `"x'${h}'"`);
+      addKey(`${label}:key(raw)`, `raw:${h}`);
+    }
+  };
 
   const addFromHex = (label: string, hex: string) => {
     const h = hex.toLowerCase();
@@ -271,6 +291,12 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     }
   };
 
+  const addDerivedSha256 = (label: string, digestHex: string) => {
+    // The derived SHA256 digest is a 64-char hex string; include both passphrase and raw-key forms.
+    addKey(label, digestHex);
+    addFromHexBasic(`${label}:as-hex`, digestHex);
+  };
+
   const envKey = process.env.RAYBRIDGE_RAYCAST_DB_KEY;
   if (envKey && envKey.trim().length > 0) {
     addKey("env:RAYBRIDGE_RAYCAST_DB_KEY", envKey.trim());
@@ -281,11 +307,19 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     const lastKeyPath = join(getRaycastDataDir(), "last_key");
     if (existsSync(lastKeyPath)) {
       const lastKeyBytes = readFileSync(lastKeyPath);
+      if (debug) {
+        const lastKeyUtf8 = trimNulls(lastKeyBytes.toString("utf8"));
+        console.log(
+          `raybridge: windows last_key: bytes=${lastKeyBytes.length}, utf8Len=${lastKeyUtf8.length}, utf8Printable=${isPrintableAscii(
+            lastKeyUtf8
+          )}`
+        );
+      }
 
       const lastKeyUtf8 = trimNulls(lastKeyBytes.toString("utf8"));
       if (lastKeyUtf8 && isPrintableAscii(lastKeyUtf8)) {
         addKey("last_key:utf8", lastKeyUtf8);
-        addKey(
+        addDerivedSha256(
           "last_key:utf8:sha256(+salt)",
           sha256Hex(lastKeyUtf8 + RAYCAST_SALT)
         );
@@ -296,12 +330,12 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
       }
 
       addFromHex("last_key:bytes", lastKeyBytes.toString("hex"));
-      addKey(
+      addDerivedSha256(
         "last_key:bytes:sha256(bytes+salt)",
         sha256HexBytes(lastKeyBytes, Buffer.from(RAYCAST_SALT, "utf8"))
       );
-      addKey("last_key:bytes:sha256(bytes)", sha256HexBytes(lastKeyBytes));
-      addKey(
+      addDerivedSha256("last_key:bytes:sha256(bytes)", sha256HexBytes(lastKeyBytes));
+      addDerivedSha256(
         "last_key:bytes:sha256(salt+bytes)",
         sha256HexBytes(Buffer.from(RAYCAST_SALT, "utf8"), lastKeyBytes)
       );
@@ -322,10 +356,15 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
       const lastKeyB64 = lastKeyBytes.toString("base64");
       if (lastKeyB64) {
         addKey("last_key:bytes:base64", lastKeyB64);
-        addKey(
+        addDerivedSha256(
           "last_key:bytes:sha256(b64+salt)",
           sha256Hex(lastKeyB64 + RAYCAST_SALT)
         );
+        addDerivedSha256(
+          "last_key:bytes:sha256(salt+b64)",
+          sha256Hex(RAYCAST_SALT + lastKeyB64)
+        );
+        addDerivedSha256("last_key:bytes:sha256(b64)", sha256Hex(lastKeyB64));
       }
     }
   } catch {
@@ -345,13 +384,22 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     const blob = readWindowsCredentialBlob(target);
     if (!blob) continue;
 
+    if (debug) {
+      const utf8 = trimNulls(blob.toString("utf8"));
+      const utf8Printable = !!(utf8 && isPrintableAscii(utf8));
+      const decoded = utf8Printable ? tryDecodeBase64(utf8) : null;
+      console.log(
+        `raybridge: windows cred ${target}: bytes=${blob.length}, utf8Len=${utf8.length}, utf8Printable=${utf8Printable}, base64DecodedBytes=${decoded ? decoded.length : 0}`
+      );
+    }
+
     addFromHex(`cred:${target}:bytes`, blob.toString("hex"));
-    addKey(
+    addDerivedSha256(
       `cred:${target}:bytes:sha256(bytes+salt)`,
       sha256HexBytes(blob, Buffer.from(RAYCAST_SALT, "utf8"))
     );
-    addKey(`cred:${target}:bytes:sha256(bytes)`, sha256HexBytes(blob));
-    addKey(
+    addDerivedSha256(`cred:${target}:bytes:sha256(bytes)`, sha256HexBytes(blob));
+    addDerivedSha256(
       `cred:${target}:bytes:sha256(salt+bytes)`,
       sha256HexBytes(Buffer.from(RAYCAST_SALT, "utf8"), blob)
     );
@@ -372,15 +420,15 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     const utf8 = trimNulls(blob.toString("utf8"));
     if (utf8 && isPrintableAscii(utf8)) {
       addKey(`cred:${target}:utf8`, utf8);
-      addKey(
+      addDerivedSha256(
         `cred:${target}:utf8:sha256(+salt)`,
         sha256Hex(utf8 + RAYCAST_SALT)
       );
-      addKey(
+      addDerivedSha256(
         `cred:${target}:utf8:sha256(salt+)`,
         sha256Hex(RAYCAST_SALT + utf8)
       );
-      addKey(`cred:${target}:utf8:sha256(utf8)`, sha256Hex(utf8));
+      addDerivedSha256(`cred:${target}:utf8:sha256(utf8)`, sha256Hex(utf8));
 
       // If the credential blob itself is a base64/base64url string, decode it and treat as raw key material.
       const decoded = tryDecodeBase64(utf8);
@@ -389,7 +437,7 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
           `cred:${target}:utf8:base64-decoded`,
           decoded.toString("hex")
         );
-        addKey(
+        addDerivedSha256(
           `cred:${target}:utf8:base64-decoded:sha256(bytes+salt)`,
           sha256HexBytes(decoded, Buffer.from(RAYCAST_SALT, "utf8"))
         );
@@ -405,35 +453,57 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
             decoded.subarray(0, 48).toString("hex")
           );
         }
+
+        // If the decoded bytes are themselves a printable string, try that representation too.
+        const decodedUtf8 = trimNulls(decoded.toString("utf8"));
+        if (decodedUtf8 && isPrintableAscii(decodedUtf8)) {
+          addKey(`cred:${target}:utf8:base64-decoded:utf8`, decodedUtf8);
+          addDerivedSha256(
+            `cred:${target}:utf8:base64-decoded:utf8:sha256(+salt)`,
+            sha256Hex(decodedUtf8 + RAYCAST_SALT)
+          );
+          addDerivedSha256(
+            `cred:${target}:utf8:base64-decoded:utf8:sha256(salt+)`,
+            sha256Hex(RAYCAST_SALT + decodedUtf8)
+          );
+          addDerivedSha256(
+            `cred:${target}:utf8:base64-decoded:utf8:sha256(utf8)`,
+            sha256Hex(decodedUtf8)
+          );
+
+          if (/^[0-9a-fA-F]+$/.test(decodedUtf8) && decodedUtf8.length % 2 === 0) {
+            addFromHex(`cred:${target}:utf8:base64-decoded:utf8-hex`, decodedUtf8);
+          }
+        }
       }
     }
 
     const utf16 = trimNulls(blob.toString("utf16le"));
     if (utf16 && isPrintableAscii(utf16)) {
       addKey(`cred:${target}:utf16le`, utf16);
-      addKey(
+      addDerivedSha256(
         `cred:${target}:utf16le:sha256(+salt)`,
         sha256Hex(utf16 + RAYCAST_SALT)
       );
-      addKey(
+      addDerivedSha256(
         `cred:${target}:utf16le:sha256(salt+)`,
         sha256Hex(RAYCAST_SALT + utf16)
       );
-      addKey(`cred:${target}:utf16le:sha256(utf16)`, sha256Hex(utf16));
+      addDerivedSha256(`cred:${target}:utf16le:sha256(utf16)`, sha256Hex(utf16));
     }
 
     const b64 = blob.toString("base64");
     if (b64) {
       addKey(`cred:${target}:bytes:base64`, b64);
-      addKey(
+      addDerivedSha256(
         `cred:${target}:bytes:base64:sha256(+salt)`,
         sha256Hex(b64 + RAYCAST_SALT)
       );
-      addKey(
+      addDerivedSha256(
         `cred:${target}:bytes:base64:sha256(salt+)`,
         sha256Hex(RAYCAST_SALT + b64)
       );
-      addKey(`cred:${target}:bytes:base64:sha256(b64)`, sha256Hex(b64));
+      addDerivedSha256(`cred:${target}:bytes:base64:sha256(b64)`, sha256Hex(b64));
     }
   }
 
@@ -501,6 +571,15 @@ function getInitCandidates(): InitCandidate[] {
   const rc4 = "PRAGMA cipher = 'rc4';\n";
   add("rc4", rc4);
   addWal("rc4", rc4);
+
+  // Ascon and AEGIS cipher schemes (supported by SQLite3MultipleCiphers >= 2.2.0).
+  const ascon128 = "PRAGMA cipher = 'ascon128';\n";
+  add("ascon128", ascon128);
+  addWal("ascon128", ascon128);
+
+  const aegis = "PRAGMA cipher = 'aegis';\n";
+  add("aegis", aegis);
+  addWal("aegis", aegis);
 
   // De-dup while preserving order.
   const seen = new Set<string>();
