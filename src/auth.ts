@@ -252,6 +252,8 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     // Interpret the hex string as a normal passphrase string.
     addKey(`${label}:key(passphrase-hex)`, h);
     addKey(`${label}:key(sha256(hex+salt))`, sha256Hex(h + RAYCAST_SALT));
+    addKey(`${label}:key(sha256(salt+hex))`, sha256Hex(RAYCAST_SALT + h));
+    addKey(`${label}:key(sha256(hex))`, sha256Hex(h));
 
     // Interpret the underlying bytes as the passphrase (binary key).
     addHexkey(`${label}:hexkey(binary-passphrase)`, h);
@@ -259,7 +261,12 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
     // Interpret as raw key material (no KDF). Only meaningful for 32-byte key (64 hex chars)
     // or 32-byte key + 16-byte salt (96 hex chars).
     if (h.length === 64 || h.length === 96) {
+      // Raw key syntax supported by SQLite3MultipleCiphers:
+      //   PRAGMA key = "x'<64-hex-chars>'";
+      //
+      // Provide both escaped-single-quote and double-quote variants to maximize compatibility.
       addKey(`${label}:key(raw-x)`, `x'${h}'`);
+      add(`${label}:key(raw-x:double-quoted)`, "key", `"x'${h}'"`);
       addKey(`${label}:key(raw)`, `raw:${h}`);
     }
   };
@@ -292,6 +299,11 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
       addKey(
         "last_key:bytes:sha256(bytes+salt)",
         sha256HexBytes(lastKeyBytes, Buffer.from(RAYCAST_SALT, "utf8"))
+      );
+      addKey("last_key:bytes:sha256(bytes)", sha256HexBytes(lastKeyBytes));
+      addKey(
+        "last_key:bytes:sha256(salt+bytes)",
+        sha256HexBytes(Buffer.from(RAYCAST_SALT, "utf8"), lastKeyBytes)
       );
 
       if (lastKeyBytes.length >= 32) {
@@ -338,6 +350,11 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
       `cred:${target}:bytes:sha256(bytes+salt)`,
       sha256HexBytes(blob, Buffer.from(RAYCAST_SALT, "utf8"))
     );
+    addKey(`cred:${target}:bytes:sha256(bytes)`, sha256HexBytes(blob));
+    addKey(
+      `cred:${target}:bytes:sha256(salt+bytes)`,
+      sha256HexBytes(Buffer.from(RAYCAST_SALT, "utf8"), blob)
+    );
 
     if (blob.length >= 32) {
       addFromHex(
@@ -359,6 +376,11 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
         `cred:${target}:utf8:sha256(+salt)`,
         sha256Hex(utf8 + RAYCAST_SALT)
       );
+      addKey(
+        `cred:${target}:utf8:sha256(salt+)`,
+        sha256Hex(RAYCAST_SALT + utf8)
+      );
+      addKey(`cred:${target}:utf8:sha256(utf8)`, sha256Hex(utf8));
 
       // If the credential blob itself is a base64/base64url string, decode it and treat as raw key material.
       const decoded = tryDecodeBase64(utf8);
@@ -393,6 +415,11 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
         `cred:${target}:utf16le:sha256(+salt)`,
         sha256Hex(utf16 + RAYCAST_SALT)
       );
+      addKey(
+        `cred:${target}:utf16le:sha256(salt+)`,
+        sha256Hex(RAYCAST_SALT + utf16)
+      );
+      addKey(`cred:${target}:utf16le:sha256(utf16)`, sha256Hex(utf16));
     }
 
     const b64 = blob.toString("base64");
@@ -402,6 +429,11 @@ function getWindowsKeyCandidates(): KeyCandidate[] {
         `cred:${target}:bytes:base64:sha256(+salt)`,
         sha256Hex(b64 + RAYCAST_SALT)
       );
+      addKey(
+        `cred:${target}:bytes:base64:sha256(salt+)`,
+        sha256Hex(RAYCAST_SALT + b64)
+      );
+      addKey(`cred:${target}:bytes:base64:sha256(b64)`, sha256Hex(b64));
     }
   }
 
@@ -424,29 +456,51 @@ function getInitCandidates(): InitCandidate[] {
   const out: InitCandidate[] = [];
   const add = (label: string, initSql: string) => out.push({ label, initSql });
 
-  // SQLCipher scheme (try common compatibility/legacy modes).
-  const sqlcipher = "PRAGMA cipher = 'sqlcipher';\n";
-  add("sqlcipher", sqlcipher);
-  add("sqlcipher:legacy4", `${sqlcipher}PRAGMA legacy = 4;\n`);
-  add("sqlcipher:legacy3", `${sqlcipher}PRAGMA legacy = 3;\n`);
-  add("sqlcipher:legacy2", `${sqlcipher}PRAGMA legacy = 2;\n`);
-  add("sqlcipher:legacy1", `${sqlcipher}PRAGMA legacy = 1;\n`);
+  const addWal = (label: string, initSql: string) =>
+    add(`${label}:legacywal`, `PRAGMA mc_legacy_wal = 1;\n${initSql}`);
 
   // Default cipher scheme (SQLite3MultipleCiphers default is sqleet:ChaCha20).
   add("default", "");
-  add("chacha20", "PRAGMA cipher = 'chacha20';\n");
-  add("chacha20:legacy1", "PRAGMA cipher = 'chacha20';\nPRAGMA legacy = 1;\n");
+  addWal("default", "");
 
-  // WAL encryption legacy mode (older SQLite3MC versions).
-  add("default:legacywal", "PRAGMA mc_legacy_wal = 1;\n");
-  add(
-    "chacha20:legacywal",
-    "PRAGMA mc_legacy_wal = 1;\nPRAGMA cipher = 'chacha20';\n"
-  );
-  add(
-    "sqlcipher:legacywal",
-    "PRAGMA mc_legacy_wal = 1;\nPRAGMA cipher = 'sqlcipher';\n"
-  );
+  // sqleet (ChaCha20) explicit.
+  const chacha20 = "PRAGMA cipher = 'chacha20';\n";
+  add("chacha20", chacha20);
+  addWal("chacha20", chacha20);
+  add("chacha20:legacy1", `${chacha20}PRAGMA legacy = 1;\n`);
+  addWal("chacha20:legacy1", `${chacha20}PRAGMA legacy = 1;\n`);
+
+  // SQLCipher scheme (try compatibility/legacy modes).
+  const sqlcipher = "PRAGMA cipher = 'sqlcipher';\n";
+  const sqlcipherLegacies: Array<[string, string]> = [
+    ["sqlcipher", sqlcipher],
+    ["sqlcipher:legacy4", `${sqlcipher}PRAGMA legacy = 4;\n`],
+    ["sqlcipher:legacy3", `${sqlcipher}PRAGMA legacy = 3;\n`],
+    ["sqlcipher:legacy2", `${sqlcipher}PRAGMA legacy = 2;\n`],
+    ["sqlcipher:legacy1", `${sqlcipher}PRAGMA legacy = 1;\n`],
+  ];
+  for (const [label, initSql] of sqlcipherLegacies) {
+    add(label, initSql);
+    addWal(label, initSql);
+  }
+
+  // wxSQLite3 cipher schemes.
+  const aes256cbc = "PRAGMA cipher = 'aes256cbc';\n";
+  add("aes256cbc", aes256cbc);
+  addWal("aes256cbc", aes256cbc);
+  add("aes256cbc:legacy1", `${aes256cbc}PRAGMA legacy = 1;\n`);
+  addWal("aes256cbc:legacy1", `${aes256cbc}PRAGMA legacy = 1;\n`);
+
+  const aes128cbc = "PRAGMA cipher = 'aes128cbc';\n";
+  add("aes128cbc", aes128cbc);
+  addWal("aes128cbc", aes128cbc);
+  add("aes128cbc:legacy1", `${aes128cbc}PRAGMA legacy = 1;\n`);
+  addWal("aes128cbc:legacy1", `${aes128cbc}PRAGMA legacy = 1;\n`);
+
+  // System.Data.SQLite RC4 cipher scheme.
+  const rc4 = "PRAGMA cipher = 'rc4';\n";
+  add("rc4", rc4);
+  addWal("rc4", rc4);
 
   // De-dup while preserving order.
   const seen = new Set<string>();
