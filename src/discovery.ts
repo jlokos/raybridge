@@ -22,7 +22,7 @@ export interface ExtensionEntry {
 }
 
 export async function discoverExtensions(): Promise<ExtensionEntry[]> {
-  const extensionsDir = join(homedir(), ".config", "raycast", "extensions");
+  const extensionsDir = join(homedir(), ".config", "raycast-x", "extensions");
   const entries: ExtensionEntry[] = [];
 
   let dirs: string[];
