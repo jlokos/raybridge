@@ -149,8 +149,7 @@ Sessions auto-expire after 30 minutes of inactivity.
 
 ## Troubleshooting
 
-- `bun run debug:keys` (Windows): shows whether `BackendDBKey` sources exist (Credential Manager, `last_key`)
-- `bun run debug:auth`: prints counts (`oauth token sets` and `preferences`)
+- `bun run debug:auth`: prints counts (`oauth extensions` and `prefs extensions`)
 
 ### Windows backend access (Raycast runtime)
 
@@ -158,13 +157,12 @@ On Windows, RayBridge can copy Raycast's backend runtime from your local Raycast
 
 Environment variables:
 - `RAYBRIDGE_RAYCAST_BACKEND_CACHE_DIR`: override the per-user Raycast backend cache directory
-- `RAYBRIDGE_RAYCAST_BACKEND_CACHE_KEEP`: how many cached versions to keep (default: 2)
 - `RAYBRIDGE_DISABLE_RAYCAST_BACKEND=1`: disable the Windows backend path (Windows OAuth tokens/prefs will not load)
 
 Common errors:
 - `Windows BackendDBKey not found`: open Raycast once, sign in, then re-run
 - `Database not initialized` / `no such table`: Raycast not opened, or DB format changed
- - `sqlcipher exited ...`: ensure `sqlcipher` is installed (macOS) or set `RAYBRIDGE_SQLCIPHER_PATH`
+- `sqlcipher exited ...`: ensure `sqlcipher` is installed (macOS) or set `RAYBRIDGE_SQLCIPHER_PATH`
 
 ## CLI
 
