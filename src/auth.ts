@@ -647,6 +647,7 @@ function createDbClient(binding, raycastDir, backendKey) {
 
   const noopReport = () => {};
   const attempts: Array<[string, () => any]> = [
+    ["(raycastDir, backendKey, noopReport)", () => new C(raycastDir, backendKey, noopReport)],
     ["(raycastDir, noopReport)", () => new C(raycastDir, noopReport)],
     ["(raycastDir, backendKey)", () => new C(raycastDir, backendKey)],
     ["(raycastDir, noopReport, backendKey)", () => new C(raycastDir, noopReport, backendKey)],
@@ -755,6 +756,82 @@ function pickRowsFromResult(res) {
   if (!res) return null;
   const arr = firstArray(res);
   if (arr) return arr;
+  return null;
+}
+
+function looksLikeTokenSet(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  return typeof obj.accessToken === "string" || typeof obj.refreshToken === "string" || typeof obj.idToken === "string";
+}
+
+function findExtensionForKey(exts, key) {
+  if (typeof key !== "string" || !key) return null;
+  const k = key.toLowerCase();
+  for (const e of exts) {
+    if (!e) continue;
+    if (e.name && k.includes(String(e.name).toLowerCase())) return e;
+    if (e.uuid && k.includes(String(e.uuid).toLowerCase())) return e;
+  }
+  return null;
+}
+
+function tryExtractFromKeyValue(exts, item) {
+  if (!item || typeof item !== "object") return null;
+  const key = item.key ?? item.name ?? item.id;
+  const value = item.value ?? item.val ?? item.data;
+  if (typeof key !== "string") return null;
+
+  const ext = findExtensionForKey(exts, key);
+  if (!ext || !ext.name) return null;
+
+  // Try to interpret value as tokenSets/preferences directly.
+  const sets = parseTokenSets(value);
+  if (sets && sets.length > 0 && (looksLikeTokenSet(sets[0]) || looksLikeTokenSet(sets[sets.length - 1]))) {
+    return { kind: "tokens", extName: ext.name, value: sets };
+  }
+  const prefsObj = parsePreferences(value);
+  if (prefsObj && Object.keys(prefsObj).length > 0) {
+    return { kind: "prefs", extName: ext.name, value: prefsObj };
+  }
+
+  return null;
+}
+
+async function tryRepoReadAll(repo, label) {
+  if (!repo) return null;
+  dbg(label + " proto=" + protoKeys(repo).join(","));
+
+  const methods = [
+    "all",
+    "allItems",
+    "allUserDefaults",
+    "getAll",
+    "getAllItems",
+    "getAllUserDefaults",
+    "entries",
+    "list",
+    "dump",
+  ];
+
+  for (const m of methods) {
+    const fn = repo && repo[m];
+    if (typeof fn !== "function") continue;
+    try {
+      dbg("trying " + label + "." + m + "()");
+      const out = await maybeAwait(fn.call(repo));
+      if (!out) continue;
+      if (out && typeof out === "object") {
+        if (Array.isArray(out)) return out;
+        const arr = firstArray(out);
+        if (arr) return arr;
+        // Some repos might return a plain object map.
+        return out;
+      }
+    } catch (err) {
+      dbg(label + "." + m + " failed: " + (err && err.message ? err.message : String(err)));
+    }
+  }
+
   return null;
 }
 
@@ -898,6 +975,12 @@ async function main() {
     if (p && Object.keys(p).length > 0) prefs[name] = p;
   };
 
+  const exts = [];
+  for (const row of rows || []) {
+    if (!row || typeof row !== "object") continue;
+    exts.push({ id: row.id, name: row.name, uuid: row.uuid });
+  }
+
   // 1) Try extracting from the summary rows directly (in case a build includes these fields).
   for (const row of rows || []) extractFromRow(row);
 
@@ -911,6 +994,17 @@ async function main() {
         if (DEBUG && full && typeof full === "object") {
           dbg("getExtensionByDatabaseId(" + String(id) + ") keys=" + Object.getOwnPropertyNames(full).join(","));
         }
+        // Keep uuid if present.
+        try {
+          const name = getExtName(full);
+          const uuid = full && typeof full.uuid === "string" ? full.uuid : null;
+          if (name && uuid) {
+            const e = exts.find((x) => x && x.name === name);
+            if (e) e.uuid = uuid;
+          }
+        } catch {
+          // ignore
+        }
         extractFromRow(full);
       } catch (err) {
         dbg(
@@ -922,6 +1016,66 @@ async function main() {
       }
     }
   }
+
+  // 3) Preferences/TokenSets may now live in settings/userDefaults repos rather than nodeExtensions rows.
+  const userDefaultsRepo = await callMaybe(client, "userDefaults");
+  const settingsRepo = await callMaybe(client, "settings");
+
+  const udAll = await tryRepoReadAll(userDefaultsRepo, "userDefaults");
+  if (DEBUG && udAll) {
+    if (Array.isArray(udAll)) {
+      dbg("userDefaults readAll -> array len=" + String(udAll.length));
+      if (udAll[0] && typeof udAll[0] === "object") dbg("userDefaults[0] keys=" + Object.getOwnPropertyNames(udAll[0]).join(","));
+    } else if (udAll && typeof udAll === "object") {
+      dbg("userDefaults readAll -> object keys=" + Object.keys(udAll).slice(0, 30).join(","));
+    }
+  }
+
+  const stAll = await tryRepoReadAll(settingsRepo, "settings");
+  if (DEBUG && stAll) {
+    if (Array.isArray(stAll)) {
+      dbg("settings readAll -> array len=" + String(stAll.length));
+      if (stAll[0] && typeof stAll[0] === "object") dbg("settings[0] keys=" + Object.getOwnPropertyNames(stAll[0]).join(","));
+    } else if (stAll && typeof stAll === "object") {
+      dbg("settings readAll -> object keys=" + Object.keys(stAll).slice(0, 30).join(","));
+    }
+  }
+
+  const ingestCollection = (coll) => {
+    if (!coll) return;
+    if (Array.isArray(coll)) {
+      for (const item of coll) {
+        // Try direct shapes first.
+        extractFromRow(item);
+        const kv = tryExtractFromKeyValue(exts, item);
+        if (kv && kv.kind === "tokens") tokens[kv.extName] = kv.value;
+        if (kv && kv.kind === "prefs") prefs[kv.extName] = kv.value;
+      }
+      return;
+    }
+
+    if (coll && typeof coll === "object") {
+      // Might be a key->value map.
+      for (const [k, v] of Object.entries(coll)) {
+        const ext = findExtensionForKey(exts, k);
+        if (!ext || !ext.name) continue;
+
+        const sets = parseTokenSets(v);
+        if (sets && sets.length > 0 && (looksLikeTokenSet(sets[0]) || looksLikeTokenSet(sets[sets.length - 1]))) {
+          tokens[ext.name] = sets;
+          continue;
+        }
+
+        const p = parsePreferences(v);
+        if (p && Object.keys(p).length > 0) {
+          prefs[ext.name] = p;
+        }
+      }
+    }
+  };
+
+  ingestCollection(udAll);
+  ingestCollection(stAll);
 
   // Best-effort: ask the backend to close gracefully so node.exe can exit promptly.
   try {
