@@ -485,7 +485,6 @@ async function loadRaycastAuthDataWindowsBackend(): Promise<RaycastAuthData | nu
         "raybridge: Windows BackendDBKey not found. Open Raycast once and sign in; then re-run."
       );
     }
-    return null;
   }
 
   const backend = ensureRaycastBackendCopy();
@@ -541,72 +540,72 @@ async function maybeAwait(v) {
   return v;
 }
 
-function firstRows(res) {
+function firstArray(res) {
   if (Array.isArray(res)) return res;
   if (res && Array.isArray(res.rows)) return res.rows;
   if (res && Array.isArray(res.result)) return res.result;
+  if (res && Array.isArray(res.items)) return res.items;
+  if (res && Array.isArray(res.data)) return res.data;
   return null;
 }
 
-async function tryQuery(target, dbId, sql) {
-  if (!target) return null;
+function parsePreferences(value) {
+  if (!value) return null;
 
-  const methods = [
-    "query",
-    "queryRaw",
-    "rawQuery",
-    "select",
-    "all",
-    "execute",
-    "run",
-  ];
+  if (typeof value === "string") {
+    const parsed = safeJsonParse(value);
+    if (!parsed) return null;
+    value = parsed;
+  }
 
-  const variants = [
-    [dbId, sql],
-    [sql, dbId],
-    [{ dbPath: dbId, sql }],
-    [{ databasePath: dbId, sql }],
-    [{ path: dbId, sql }],
-    [{ database: dbId, sql }],
-    [{ kind: dbId, sql }],
-    [{ dbKind: dbId, sql }],
-    [{ databaseKind: dbId, sql }],
-    [dbId, sql, []],
-  ];
-
-  for (const m of methods) {
-    const fn = target[m];
-    if (typeof fn !== "function") continue;
-    for (const args of variants) {
-      try {
-        const out = await maybeAwait(fn.apply(target, args));
-        const rows = firstRows(out);
-        if (rows) return rows;
-      } catch (err) {
-        dbg(m + " failed: " + (err && err.message ? err.message : String(err)));
-      }
+  if (Array.isArray(value)) {
+    const out = {};
+    for (const p of value) {
+      if (!p || typeof p !== "object") continue;
+      if (typeof p.name !== "string") continue;
+      if (!Object.prototype.hasOwnProperty.call(p, "value")) continue;
+      out[p.name] = p.value;
     }
+    return Object.keys(out).length > 0 ? out : null;
   }
+
+  if (value && typeof value === "object") {
+    return value;
+  }
+
   return null;
 }
 
-function parsePreferences(prefJson) {
-  const parsed = safeJsonParse(prefJson);
-  if (!Array.isArray(parsed)) return null;
-  const out = {};
-  for (const p of parsed) {
-    if (!p || typeof p !== "object") continue;
-    if (typeof p.name !== "string") continue;
-    if (!Object.prototype.hasOwnProperty.call(p, "value")) continue;
-    out[p.name] = p.value;
+function parseTokenSets(value) {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    const parsed = safeJsonParse(value);
+    if (!parsed) return null;
+    value = parsed;
   }
-  return out;
+
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return [value];
+  return null;
 }
 
-function parseTokenSets(tokenJson) {
-  const parsed = safeJsonParse(tokenJson);
-  if (!parsed) return null;
-  return Array.isArray(parsed) ? parsed : [parsed];
+function getExtName(row) {
+  if (!row || typeof row !== "object") return null;
+  const candidates = [
+    "name",
+    "extensionName",
+    "extension_name",
+    "extensionId",
+    "extension_id",
+    "identifier",
+    "id",
+  ];
+  for (const k of candidates) {
+    const v = row[k];
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
 }
 
 function createDbClient(binding, raycastDir, backendKey) {
@@ -615,18 +614,20 @@ function createDbClient(binding, raycastDir, backendKey) {
 
   if (DEBUG) {
     try {
+      dbg("DatabaseClient length=" + String(C.length));
       dbg("DatabaseClient proto=" + Object.getOwnPropertyNames(C.prototype || {}).join(","));
     } catch {
       // ignore
     }
   }
 
+  const noopReport = () => {};
   const attempts = [
-    () => new C({ raycastDir, backendKey }),
-    () => new C({ dataDir: raycastDir, backendKey }),
-    () => new C({ dataDir: raycastDir, key: backendKey }),
+    () => new C(raycastDir),
+    () => new C(raycastDir, noopReport),
+    () => new C(raycastDir, noopReport, backendKey),
+    () => new C(raycastDir, backendKey, noopReport),
     () => new C(raycastDir, backendKey),
-    () => new C(backendKey, raycastDir),
     () => new C(),
   ];
 
@@ -634,12 +635,6 @@ function createDbClient(binding, raycastDir, backendKey) {
     try {
       const client = mk();
       if (!client) continue;
-      try {
-        if (typeof client.setKey === "function") client.setKey(backendKey);
-        if (typeof client.key === "function") client.key(backendKey);
-      } catch {
-        // ignore
-      }
       return client;
     } catch (err) {
       dbg("DatabaseClient ctor failed: " + (err && err.message ? err.message : String(err)));
@@ -650,11 +645,151 @@ function createDbClient(binding, raycastDir, backendKey) {
   return null;
 }
 
+function getDatabaseCtor(binding) {
+  const Database =
+    (binding && (binding.Database || binding.default)) ||
+    (typeof binding === "function" ? binding : null);
+  return typeof Database === "function" ? Database : null;
+}
+
+function tryOpenWithDatabase(Database, dbPath, backendKey) {
+  let db;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch {
+    try {
+      db = new Database(dbPath);
+    } catch {
+      return null;
+    }
+  }
+
+  // Best-effort: set encryption key if the binding supports it and we have a key.
+  if (backendKey) {
+    try {
+      if (db && typeof db.pragma === "function") {
+        const escaped = String(backendKey).replace(/'/g, "''");
+        db.pragma("key='" + escaped + "'");
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return db;
+}
+
+function hasExtensionsTable(db) {
+  try {
+    if (!db) return false;
+    if (typeof db.prepare === "function") {
+      const row = db
+        .prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions'")
+        .get();
+      return !!row && Number(row.c) > 0;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+function queryExtensionsTable(db) {
+  if (!db || typeof db.prepare !== "function") return [];
+  try {
+    return db
+      .prepare(
+        "SELECT name, tokenSets, preferences FROM extensions WHERE (tokenSets IS NOT NULL AND tokenSets != '') OR (preferences IS NOT NULL AND preferences != '')"
+      )
+      .all();
+  } catch {
+    return [];
+  }
+}
+
+async function callMaybe(obj, name) {
+  if (!obj) return null;
+  const v = obj[name];
+  if (typeof v === "function") return await maybeAwait(v.call(obj));
+  return v;
+}
+
+function protoKeys(obj) {
+  try {
+    const proto = Object.getPrototypeOf(obj);
+    return Object.getOwnPropertyNames(proto || {}).filter((n) => n !== "constructor");
+  } catch {
+    return [];
+  }
+}
+
+function pickRowsFromResult(res) {
+  if (!res) return null;
+  const arr = firstArray(res);
+  if (arr) return arr;
+  return null;
+}
+
+async function getNodeExtensionsRows(client) {
+  const nodeExt = await callMaybe(client, "nodeExtensions");
+  if (!nodeExt) return null;
+
+  dbg("nodeExtensions typeof=" + typeof nodeExt + " isArray=" + String(Array.isArray(nodeExt)));
+  if (Array.isArray(nodeExt)) return nodeExt;
+
+  // nodeExt is likely a repository object.
+  const repo = nodeExt;
+  dbg("NodeExtensionsRepository proto=" + protoKeys(repo).join(","));
+
+  const preferred = [
+    "getAllExtensions",
+    "getInstalledExtensions",
+    "getExtensions",
+    "getAll",
+    "all",
+    "listAll",
+    "list",
+    "entries",
+  ];
+
+  for (const m of preferred) {
+    const fn = repo && repo[m];
+    if (typeof fn !== "function") continue;
+    try {
+      dbg("trying nodeExtensions." + m + "()");
+      const out = await maybeAwait(fn.call(repo));
+      const rows = pickRowsFromResult(out);
+      if (rows) return rows;
+    } catch (err) {
+      dbg("nodeExtensions." + m + " failed: " + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  // Fallback: try any safe-looking, zero-arg getter/list method.
+  const names = protoKeys(repo);
+  for (const m of names) {
+    if (!m) continue;
+    if (!/(get|list|all|fetch|load)/i.test(m)) continue;
+    if (/(set|delete|remove|drop|insert|update|write|save|create|reset|shutdown|restore|backup)/i.test(m)) continue;
+    const fn = repo[m];
+    if (typeof fn !== "function") continue;
+    try {
+      dbg("trying nodeExtensions." + m + "()");
+      const out = await maybeAwait(fn.call(repo));
+      const rows = pickRowsFromResult(out);
+      if (rows) return rows;
+    } catch (err) {
+      dbg("nodeExtensions." + m + " failed: " + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  return null;
+}
+
 async function main() {
   const raycastDir = process.env.RAYCAST_DIR;
-  const backendKey = process.env.RAYCAST_BACKEND_DB_KEY;
+  const backendKey = process.env.RAYCAST_BACKEND_DB_KEY || "";
   if (!raycastDir) fail("RAYCAST_DIR is required");
-  if (!backendKey) fail("RAYCAST_BACKEND_DB_KEY is required");
 
   dbg("raycastDir=" + raycastDir);
   const dbFiles = listDbFiles(raycastDir);
@@ -663,71 +798,87 @@ async function main() {
 
   const binding = loadBinding();
 
+  let tokens = {};
+  let prefs = {};
+
+  // Path A: if Raycast's binding still exports a Database constructor, use the legacy "extensions" table query.
+  const Database = getDatabaseCtor(binding);
+  if (Database) {
+    dbg("using Database ctor path");
+    let db = null;
+    for (const dbPath of dbFiles) {
+      const candidate = tryOpenWithDatabase(Database, dbPath, backendKey);
+      if (!candidate) continue;
+      if (hasExtensionsTable(candidate)) {
+        db = candidate;
+        break;
+      }
+      try {
+        if (candidate && typeof candidate.close === "function") candidate.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (db) {
+      const rows = queryExtensionsTable(db);
+      for (const row of rows || []) {
+        const name = row && row.name;
+        if (typeof name !== "string" || !name) continue;
+
+        if (row && row.tokenSets != null) {
+          const sets = parseTokenSets(row.tokenSets);
+          if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
+        }
+        if (row && row.preferences != null) {
+          const p = parsePreferences(row.preferences);
+          if (p && Object.keys(p).length > 0) prefs[name] = p;
+        }
+      }
+
+      process.stdout.write(JSON.stringify({ tokens, prefs }));
+      return;
+    }
+
+    dbg("Database ctor path did not find extensions table");
+  }
+
+  // Path B: newer Raycast builds expose DatabaseClient + repositories (no direct SQL surface).
   const client = createDbClient(binding, raycastDir, backendKey);
   if (!client) fail("could not create DatabaseClient");
 
-  const probeSql =
-    "SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions';";
-  const dataSql =
-    "SELECT name, tokenSets, preferences FROM extensions " +
-    "WHERE (tokenSets IS NOT NULL AND tokenSets != '') " +
-    "OR (preferences IS NOT NULL AND preferences != '');";
-
-  let rows = null;
-
-  // Attempt 1: query by DB file path.
-  for (const dbPath of dbFiles) {
-    dbg("trying dbPath=" + path.basename(dbPath));
-    const probeRows = await tryQuery(client, dbPath, probeSql);
-    const ok = probeRows && probeRows[0] && Number(probeRows[0].c) > 0;
-    dbg("hasExtensionsTable=" + ok);
-    if (!ok) continue;
-    rows = await tryQuery(client, dbPath, dataSql);
-    if (rows) break;
+  // If initReport exists, call it with a noop callback (some builds require it).
+  try {
+    if (client && typeof client.initReport === "function") {
+      dbg("calling DatabaseClient.initReport(noop)");
+      await maybeAwait(client.initReport(() => {}));
+    }
+  } catch (err) {
+    dbg("initReport failed: " + (err && err.message ? err.message : String(err)));
   }
 
-  // Attempt 2: query by DatabaseKind.
-  if (!rows && binding && binding.DatabaseKind && typeof binding.DatabaseKind === "object") {
-    const kinds = [];
-    try {
-      for (const [k, v] of Object.entries(binding.DatabaseKind)) {
-        if (/^\\d+$/.test(k)) continue;
-        kinds.push([k, v]);
-      }
-    } catch {
-      // ignore
-    }
-
-    dbg("DatabaseKind keys=" + kinds.map((kv) => kv[0]).join(","));
-
-    for (const [k, v] of kinds) {
-      dbg("trying kind=" + k);
-      const probeRows = await tryQuery(client, v, probeSql);
-      const ok = probeRows && probeRows[0] && Number(probeRows[0].c) > 0;
-      dbg("hasExtensionsTable=" + ok);
-      if (!ok) continue;
-      rows = await tryQuery(client, v, dataSql);
-      if (rows) break;
-    }
-  }
-
-  if (!rows) fail("could not open any Raycast DB with extensions table");
-
-  const tokens = {};
-  const prefs = {};
+  const rows = await getNodeExtensionsRows(client);
+  if (!rows) fail("could not read node extensions via DatabaseClient");
 
   for (const row of rows || []) {
-    const name = row && row.name;
-    if (typeof name !== "string" || !name) continue;
+    const name = getExtName(row);
+    if (!name) continue;
 
-    if (typeof row.tokenSets === "string" && row.tokenSets.trim()) {
-      const sets = parseTokenSets(row.tokenSets);
-      if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
+    const sets = parseTokenSets(row && (row.tokenSets ?? row.token_sets ?? row.tokens ?? row.oauthTokens));
+    if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
+
+    const p = parsePreferences(row && (row.preferences ?? row.prefs ?? row.userPreferences));
+    if (p && Object.keys(p).length > 0) prefs[name] = p;
+  }
+
+  // Best-effort: ask the backend to close gracefully so node.exe can exit promptly.
+  try {
+    if (client && typeof client.shutdown === "function") {
+      dbg("calling DatabaseClient.shutdown()");
+      await maybeAwait(client.shutdown());
     }
-    if (typeof row.preferences === "string" && row.preferences.trim()) {
-      const p = parsePreferences(row.preferences);
-      if (p && Object.keys(p).length > 0) prefs[name] = p;
-    }
+  } catch {
+    // ignore
   }
 
   process.stdout.write(JSON.stringify({ tokens, prefs }));
@@ -741,7 +892,7 @@ main().catch((err) => fail(err && err.message ? err.message : String(err)));
     env: {
       ...process.env,
       RAYCAST_DIR: dataDir,
-      RAYCAST_BACKEND_DB_KEY: key,
+      RAYCAST_BACKEND_DB_KEY: key || "",
     },
     encoding: "utf-8",
     maxBuffer: 50 * 1024 * 1024,
