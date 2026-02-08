@@ -610,7 +610,35 @@ function parseTokenSets(value) {
   }
 
   if (Array.isArray(value)) return value;
-  if (value && typeof value === "object") return [value];
+  if (value && typeof value === "object") {
+    if (looksLikeTokenSet(value)) return [value];
+
+    // Some Raycast builds store tokens as a map (e.g. providerId -> tokenSet).
+    const out = [];
+    try {
+      for (const v of Object.values(value)) {
+        if (!v) continue;
+        if (Array.isArray(v)) {
+          for (const x of v) {
+            if (looksLikeTokenSet(x)) out.push(x);
+          }
+          continue;
+        }
+        if (looksLikeTokenSet(v)) {
+          out.push(v);
+          continue;
+        }
+        if (v && typeof v === "object") {
+          // Common nested wrappers.
+          if (looksLikeTokenSet(v.tokenSet)) out.push(v.tokenSet);
+          if (looksLikeTokenSet(v.token)) out.push(v.token);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return out.length > 0 ? out : null;
+  }
   return null;
 }
 
@@ -1023,7 +1051,7 @@ async function main() {
     );
     if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
 
-    const p = parsePreferences(row && (row.preferences ?? row.prefs ?? row.userPreferences));
+    const p = parsePreferences(row && (row.preferences ?? row.prefs ?? row.userPreferences ?? row.storedValues));
     if (p && Object.keys(p).length > 0) prefs[name] = p;
   };
 
@@ -1031,6 +1059,30 @@ async function main() {
   for (const row of rows || []) {
     if (!row || typeof row !== "object") continue;
     exts.push({ id: row.id, name: row.name, uuid: row.uuid });
+  }
+
+  function findExtensionBySettingsId(settingsId) {
+    if (typeof settingsId === "string") {
+      const s = settingsId.toLowerCase();
+      return exts.find((e) => e && typeof e.uuid === "string" && e.uuid.toLowerCase() === s) || null;
+    }
+    if (typeof settingsId === "number") {
+      return exts.find((e) => e && e.id === settingsId) || null;
+    }
+    return null;
+  }
+
+  function extractFromExtensionSettingsRow(row) {
+    if (!row || typeof row !== "object") return;
+    const settingsId = row.id ?? row.uuid ?? row.extensionUuid ?? row.extension_uuid;
+    const ext = findExtensionBySettingsId(settingsId);
+    if (!ext || !ext.name) return;
+
+    const sets = parseTokenSets(row.oauthTokens ?? row.oauthTokenSets ?? row.tokenSets);
+    if (sets && Array.isArray(sets) && sets.length > 0) tokens[ext.name] = sets;
+
+    const p = parsePreferences(row.storedValues ?? row.preferences);
+    if (p && Object.keys(p).length > 0) prefs[ext.name] = p;
   }
 
   // 1) Try extracting from the summary rows directly (in case a build includes these fields).
@@ -1167,21 +1219,18 @@ async function main() {
   // 5) Settings repository has explicit extension settings accessors.
   if (settingsRepo) {
     await tryCall0(settingsRepo, "settings", "sanityCheck");
-    const allNode =
-      (await tryCall0(settingsRepo, "settings", "allNodeExtensionsSettings")) ||
-      (await tryCall0(settingsRepo, "settings", "allInternalExtensionsSettings")) ||
-      (await tryCall0(settingsRepo, "settings", "allCommandSettings"));
-    ingestCollection(allNode);
+    const allNode = await tryCall0(settingsRepo, "settings", "allNodeExtensionsSettings");
+    if (Array.isArray(allNode)) {
+      for (const r of allNode) extractFromExtensionSettingsRow(r);
+    } else {
+      ingestCollection(allNode);
+    }
 
     for (const e of exts) {
       if (!e) continue;
       if (e.uuid) {
         const one = await tryCall1(settingsRepo, "settings", "getNodeExtensionSettings", e.uuid);
-        ingestCollection(one);
-      }
-      if (e.id != null) {
-        const one = await tryCall1(settingsRepo, "settings", "getNodeExtensionSettings", e.id);
-        ingestCollection(one);
+        extractFromExtensionSettingsRow(one);
       }
     }
   }
