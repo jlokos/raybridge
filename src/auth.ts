@@ -860,6 +860,20 @@ async function main() {
   const rows = await getNodeExtensionsRows(client);
   if (!rows) fail("could not read node extensions via DatabaseClient");
 
+  try {
+    dbg("nodeExtensions rows=" + String(rows.length));
+    if (DEBUG && rows.length > 0) {
+      const r0 = rows[0];
+      if (r0 && typeof r0 === "object") {
+        dbg("nodeExtensions row[0] keys=" + Object.getOwnPropertyNames(r0).join(","));
+      } else {
+        dbg("nodeExtensions row[0] typeof=" + typeof r0);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   for (const row of rows || []) {
     const name = getExtName(row);
     if (!name) continue;
