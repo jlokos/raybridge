@@ -523,7 +523,9 @@ const path = require("node:path");
 const DEBUG = process.env.RAYBRIDGE_DEBUG_WINDOWS_BACKEND === "1";
 function dbg(msg) {
   if (!DEBUG) return;
-  try { process.stderr.write("[raybridge-backend] " + String(msg) + "\\n"); } catch {}
+  try {
+    process.stderr.write("[raybridge-backend] " + String(msg) + "\\n");
+  } catch {}
 }
 
 function fail(msg) {
@@ -532,31 +534,11 @@ function fail(msg) {
 }
 
 function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
-}
-
-function listDbFiles(dir) {
   try {
-    const entries = fs.readdirSync(dir);
-    return entries
-      .filter((n) => /\\.(db|sqlite|sqlite3)$/i.test(n))
-      .map((n) => path.join(dir, n));
+    return JSON.parse(s);
   } catch {
-    return [];
+    return null;
   }
-}
-
-function loadBinding() {
-  const bindingPath = path.join(process.cwd(), "data.win32-x64-msvc.node");
-  if (!fs.existsSync(bindingPath)) fail("missing backend binding: " + bindingPath);
-  let binding;
-  try {
-    binding = require(bindingPath);
-  } catch (err) {
-    fail("could not require binding: " + (err && err.message ? err.message : String(err)));
-  }
-  dbg("binding keys=" + Object.keys(binding || {}).join(","));
-  return binding;
 }
 
 async function maybeAwait(v) {
@@ -564,16 +546,57 @@ async function maybeAwait(v) {
   return v;
 }
 
-function firstArray(res) {
-  if (Array.isArray(res)) return res;
-  if (res && Array.isArray(res.rows)) return res.rows;
-  if (res && Array.isArray(res.result)) return res.result;
-  if (res && Array.isArray(res.items)) return res.items;
-  if (res && Array.isArray(res.data)) return res.data;
+function looksLikeTokenSet(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  return (
+    typeof obj.accessToken === "string" ||
+    typeof obj.refreshToken === "string" ||
+    typeof obj.idToken === "string"
+  );
+}
+
+function normalizeTokenSets(value) {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    const parsed = safeJsonParse(value);
+    if (!parsed) return null;
+    value = parsed;
+  }
+
+  if (Array.isArray(value)) return value;
+
+  if (value && typeof value === "object") {
+    if (looksLikeTokenSet(value)) return [value];
+
+    // Some builds store tokens as a map (e.g. providerId -> tokenSet).
+    const out = [];
+    try {
+      for (const v of Object.values(value)) {
+        if (!v) continue;
+        if (Array.isArray(v)) {
+          for (const x of v) if (looksLikeTokenSet(x)) out.push(x);
+          continue;
+        }
+        if (looksLikeTokenSet(v)) {
+          out.push(v);
+          continue;
+        }
+        if (v && typeof v === "object") {
+          if (looksLikeTokenSet(v.tokenSet)) out.push(v.tokenSet);
+          if (looksLikeTokenSet(v.token)) out.push(v.token);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return out.length > 0 ? out : null;
+  }
+
   return null;
 }
 
-function parsePreferences(value) {
+function normalizePrefs(value) {
   if (!value) return null;
 
   if (typeof value === "string") {
@@ -593,71 +616,21 @@ function parsePreferences(value) {
     return Object.keys(out).length > 0 ? out : null;
   }
 
-  if (value && typeof value === "object") {
-    return value;
-  }
-
+  if (value && typeof value === "object") return value;
   return null;
 }
 
-function parseTokenSets(value) {
-  if (!value) return null;
-
-  if (typeof value === "string") {
-    const parsed = safeJsonParse(value);
-    if (!parsed) return null;
-    value = parsed;
+function loadBinding() {
+  const bindingPath = path.join(process.cwd(), "data.win32-x64-msvc.node");
+  if (!fs.existsSync(bindingPath)) fail("missing backend binding: " + bindingPath);
+  let binding;
+  try {
+    binding = require(bindingPath);
+  } catch (err) {
+    fail("could not require binding: " + (err && err.message ? err.message : String(err)));
   }
-
-  if (Array.isArray(value)) return value;
-  if (value && typeof value === "object") {
-    if (looksLikeTokenSet(value)) return [value];
-
-    // Some Raycast builds store tokens as a map (e.g. providerId -> tokenSet).
-    const out = [];
-    try {
-      for (const v of Object.values(value)) {
-        if (!v) continue;
-        if (Array.isArray(v)) {
-          for (const x of v) {
-            if (looksLikeTokenSet(x)) out.push(x);
-          }
-          continue;
-        }
-        if (looksLikeTokenSet(v)) {
-          out.push(v);
-          continue;
-        }
-        if (v && typeof v === "object") {
-          // Common nested wrappers.
-          if (looksLikeTokenSet(v.tokenSet)) out.push(v.tokenSet);
-          if (looksLikeTokenSet(v.token)) out.push(v.token);
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return out.length > 0 ? out : null;
-  }
-  return null;
-}
-
-function getExtName(row) {
-  if (!row || typeof row !== "object") return null;
-  const candidates = [
-    "name",
-    "extensionName",
-    "extension_name",
-    "extensionId",
-    "extension_id",
-    "identifier",
-    "id",
-  ];
-  for (const k of candidates) {
-    const v = row[k];
-    if (typeof v === "string" && v) return v;
-  }
-  return null;
+  if (DEBUG) dbg("binding keys=" + Object.keys(binding || {}).join(","));
+  return binding;
 }
 
 function createDbClient(binding, raycastDir, backendKey) {
@@ -674,14 +647,9 @@ function createDbClient(binding, raycastDir, backendKey) {
   }
 
   const noopReport = () => {};
-  const attempts: Array<[string, () => any]> = [
+  const attempts = [
     ["(raycastDir, backendKey, noopReport)", () => new C(raycastDir, backendKey, noopReport)],
-    ["(raycastDir, noopReport)", () => new C(raycastDir, noopReport)],
     ["(raycastDir, backendKey)", () => new C(raycastDir, backendKey)],
-    ["(raycastDir, noopReport, backendKey)", () => new C(raycastDir, noopReport, backendKey)],
-    ["({ raycastDir, backendKey })", () => new C({ raycastDir, backendKey })],
-    ["({ dataDir: raycastDir, backendKey })", () => new C({ dataDir: raycastDir, backendKey })],
-    ["({ dataDir: raycastDir, key: backendKey })", () => new C({ dataDir: raycastDir, key: backendKey })],
     ["(raycastDir)", () => new C(raycastDir)],
     ["()", () => new C()],
   ];
@@ -690,77 +658,14 @@ function createDbClient(binding, raycastDir, backendKey) {
     try {
       const client = mk();
       if (!client) continue;
-      dbg("DatabaseClient ctor ok: " + label);
+      if (DEBUG) dbg("DatabaseClient ctor ok: " + label);
       return client;
     } catch (err) {
-      dbg("DatabaseClient ctor failed: " + (err && err.message ? err.message : String(err)));
-      continue;
+      if (DEBUG) dbg("DatabaseClient ctor failed: " + (err && err.message ? err.message : String(err)));
     }
   }
 
   return null;
-}
-
-function getDatabaseCtor(binding) {
-  const Database =
-    (binding && (binding.Database || binding.default)) ||
-    (typeof binding === "function" ? binding : null);
-  return typeof Database === "function" ? Database : null;
-}
-
-function tryOpenWithDatabase(Database, dbPath, backendKey) {
-  let db;
-  try {
-    db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  } catch {
-    try {
-      db = new Database(dbPath);
-    } catch {
-      return null;
-    }
-  }
-
-  // Best-effort: set encryption key if the binding supports it and we have a key.
-  if (backendKey) {
-    try {
-      if (db && typeof db.pragma === "function") {
-        const escaped = String(backendKey).replace(/'/g, "''");
-        db.pragma("key='" + escaped + "'");
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return db;
-}
-
-function hasExtensionsTable(db) {
-  try {
-    if (!db) return false;
-    if (typeof db.prepare === "function") {
-      const row = db
-        .prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions'")
-        .get();
-      return !!row && Number(row.c) > 0;
-    }
-  } catch {
-    // ignore
-  }
-  return false;
-}
-
-function queryExtensionsTable(db) {
-  if (!db || typeof db.prepare !== "function") return [];
-  try {
-    return db
-      .prepare(
-        "SELECT name, tokenSets, preferences FROM extensions WHERE (tokenSets IS NOT NULL AND tokenSets != '') OR (preferences IS NOT NULL AND preferences != '')"
-      )
-      .all();
-  } catch {
-    return [];
-  }
 }
 
 async function callMaybe(obj, name) {
@@ -779,471 +684,66 @@ function protoKeys(obj) {
   }
 }
 
-function pickRowsFromResult(res) {
-  if (!res) return null;
-  const arr = firstArray(res);
-  if (arr) return arr;
-  return null;
-}
-
-function logShape(label, out) {
-  if (!DEBUG) return;
-  try {
-    if (Array.isArray(out)) {
-      dbg(label + " -> array len=" + String(out.length));
-      if (out[0] && typeof out[0] === "object") {
-        dbg(label + "[0] keys=" + Object.getOwnPropertyNames(out[0]).join(","));
-      } else if (out.length > 0) {
-        dbg(label + "[0] typeof=" + typeof out[0]);
-      }
-      return;
-    }
-    if (out && typeof out === "object") {
-      const keys = Object.keys(out);
-      dbg(label + " -> object keys=" + keys.slice(0, 30).join(",") + (keys.length > 30 ? ",..." : ""));
-      return;
-    }
-    dbg(label + " -> typeof=" + typeof out);
-  } catch {
-    // ignore
-  }
-}
-
-function looksLikeTokenSet(obj) {
-  if (!obj || typeof obj !== "object") return false;
-  return typeof obj.accessToken === "string" || typeof obj.refreshToken === "string" || typeof obj.idToken === "string";
-}
-
-function findExtensionForKey(exts, key) {
-  if (typeof key !== "string" || !key) return null;
-  const k = key.toLowerCase();
-  for (const e of exts) {
-    if (!e) continue;
-    if (e.name && k.includes(String(e.name).toLowerCase())) return e;
-    if (e.uuid && k.includes(String(e.uuid).toLowerCase())) return e;
-  }
-  return null;
-}
-
-function tryExtractFromKeyValue(exts, item) {
-  if (!item || typeof item !== "object") return null;
-  const key = item.key ?? item.name ?? item.id;
-  const value = item.value ?? item.val ?? item.data;
-  if (typeof key !== "string") return null;
-
-  const ext = findExtensionForKey(exts, key);
-  if (!ext || !ext.name) return null;
-
-  // Try to interpret value as tokenSets/preferences directly.
-  const sets = parseTokenSets(value);
-  if (sets && sets.length > 0 && (looksLikeTokenSet(sets[0]) || looksLikeTokenSet(sets[sets.length - 1]))) {
-    return { kind: "tokens", extName: ext.name, value: sets };
-  }
-  const prefsObj = parsePreferences(value);
-  if (prefsObj && Object.keys(prefsObj).length > 0) {
-    return { kind: "prefs", extName: ext.name, value: prefsObj };
-  }
-
-  return null;
-}
-
-async function tryRepoReadAll(repo, label) {
-  if (!repo) return null;
-  dbg(label + " proto=" + protoKeys(repo).join(","));
-
-  const methods = [
-    "all",
-    "allItems",
-    "allUserDefaults",
-    "getAll",
-    "getAllItems",
-    "getAllUserDefaults",
-    "entries",
-    "list",
-    "dump",
-  ];
-
-  for (const m of methods) {
-    const fn = repo && repo[m];
-    if (typeof fn !== "function") continue;
-    try {
-      dbg("trying " + label + "." + m + "()");
-      const out = await maybeAwait(fn.call(repo));
-      if (!out) continue;
-      if (out && typeof out === "object") {
-        if (Array.isArray(out)) return out;
-        const arr = firstArray(out);
-        if (arr) return arr;
-        // Some repos might return a plain object map.
-        return out;
-      }
-    } catch (err) {
-      dbg(label + "." + m + " failed: " + (err && err.message ? err.message : String(err)));
-    }
-  }
-
-  return null;
-}
-
-async function tryCall0(obj, label, methodName) {
-  if (!obj) return null;
-  const fn = obj[methodName];
-  if (typeof fn !== "function") return null;
-  try {
-    dbg("trying " + label + "." + methodName + "()");
-    const out = await maybeAwait(fn.call(obj));
-    logShape(label + "." + methodName, out);
-    return out;
-  } catch (err) {
-    dbg(label + "." + methodName + " failed: " + (err && err.message ? err.message : String(err)));
-    return null;
-  }
-}
-
-async function tryCall1(obj, label, methodName, arg) {
-  if (!obj) return null;
-  const fn = obj[methodName];
-  if (typeof fn !== "function") return null;
-  try {
-    dbg("trying " + label + "." + methodName + "(" + String(arg) + ")");
-    const out = await maybeAwait(fn.call(obj, arg));
-    logShape(label + "." + methodName, out);
-    return out;
-  } catch (err) {
-    dbg(label + "." + methodName + " failed: " + (err && err.message ? err.message : String(err)));
-    return null;
-  }
-}
-
-async function getNodeExtensionsRows(client) {
-  const nodeExt = await callMaybe(client, "nodeExtensions");
-  if (!nodeExt) return null;
-
-  dbg("nodeExtensions typeof=" + typeof nodeExt + " isArray=" + String(Array.isArray(nodeExt)));
-  if (Array.isArray(nodeExt)) return nodeExt;
-
-  // nodeExt is likely a repository object.
-  const repo = nodeExt;
-  dbg("NodeExtensionsRepository proto=" + protoKeys(repo).join(","));
-
-  // Known-good on current Windows builds: allExtensions()
-  const fn = repo && repo.allExtensions;
-  if (typeof fn !== "function") return null;
-  try {
-    dbg("trying nodeExtensions.allExtensions()");
-    const out = await maybeAwait(fn.call(repo));
-    const rows = pickRowsFromResult(out);
-    return rows || null;
-  } catch (err) {
-    dbg(
-      "nodeExtensions.allExtensions failed: " + (err && err.message ? err.message : String(err))
-    );
-    return null;
-  }
-}
-
 async function main() {
   const raycastDir = process.env.RAYCAST_DIR;
   const backendKey = process.env.RAYCAST_BACKEND_DB_KEY || "";
   if (!raycastDir) fail("RAYCAST_DIR is required");
 
-  dbg("raycastDir=" + raycastDir);
-  const dbFiles = listDbFiles(raycastDir);
-  dbg("dbFiles=" + dbFiles.map((p) => path.basename(p)).join(","));
-  if (dbFiles.length === 0) fail("no DB files found under " + raycastDir);
+  if (DEBUG) dbg("raycastDir=" + raycastDir);
 
   const binding = loadBinding();
-
-  let tokens = {};
-  let prefs = {};
-
-  // Path A: if Raycast's binding still exports a Database constructor, use the legacy "extensions" table query.
-  const Database = getDatabaseCtor(binding);
-  if (Database) {
-    dbg("using Database ctor path");
-    let db = null;
-    for (const dbPath of dbFiles) {
-      const candidate = tryOpenWithDatabase(Database, dbPath, backendKey);
-      if (!candidate) continue;
-      if (hasExtensionsTable(candidate)) {
-        db = candidate;
-        break;
-      }
-      try {
-        if (candidate && typeof candidate.close === "function") candidate.close();
-      } catch {
-        // ignore
-      }
-    }
-
-    if (db) {
-      const rows = queryExtensionsTable(db);
-      for (const row of rows || []) {
-        const name = row && row.name;
-        if (typeof name !== "string" || !name) continue;
-
-        if (row && row.tokenSets != null) {
-          const sets = parseTokenSets(row.tokenSets);
-          if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
-        }
-        if (row && row.preferences != null) {
-          const p = parsePreferences(row.preferences);
-          if (p && Object.keys(p).length > 0) prefs[name] = p;
-        }
-      }
-
-      process.stdout.write(JSON.stringify({ tokens, prefs }));
-      return;
-    }
-
-    dbg("Database ctor path did not find extensions table");
-  }
-
-  // Path B: newer Raycast builds expose DatabaseClient + repositories (no direct SQL surface).
   const client = createDbClient(binding, raycastDir, backendKey);
   if (!client) fail("could not create DatabaseClient");
 
-  // If initReport exists, call it with a noop callback (some builds require it).
-  try {
-    if (client && typeof client.initReport === "function") {
-      dbg("calling DatabaseClient.initReport(noop)");
-      await maybeAwait(client.initReport(() => {}));
-    }
-  } catch (err) {
-    dbg("initReport failed: " + (err && err.message ? err.message : String(err)));
-  }
-
-  const rows = await getNodeExtensionsRows(client);
-  if (!rows) fail("could not read node extensions via DatabaseClient");
-
-  try {
-    dbg("nodeExtensions rows=" + String(rows.length));
-    if (DEBUG && rows.length > 0) {
-      const r0 = rows[0];
-      if (r0 && typeof r0 === "object") {
-        dbg("nodeExtensions row[0] keys=" + Object.getOwnPropertyNames(r0).join(","));
-      } else {
-        dbg("nodeExtensions row[0] typeof=" + typeof r0);
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // The extension summary rows often do not include tokenSets/preferences.
-  // Fetch full extension records by DB id and pull secrets from there (best-effort).
+  const settingsRepo = await callMaybe(client, "settings");
   const nodeExtRepo = await callMaybe(client, "nodeExtensions");
-  const getById =
-    nodeExtRepo && typeof nodeExtRepo.getExtensionByDatabaseId === "function"
-      ? nodeExtRepo.getExtensionByDatabaseId.bind(nodeExtRepo)
-      : null;
+  if (!settingsRepo) fail("missing settings repo");
+  if (!nodeExtRepo) fail("missing nodeExtensions repo");
 
   if (DEBUG) {
-    dbg("has getExtensionByDatabaseId=" + String(!!getById));
+    dbg("settings proto=" + protoKeys(settingsRepo).join(","));
+    dbg("nodeExtensions proto=" + protoKeys(nodeExtRepo).join(","));
   }
 
-  const extractFromRow = (row) => {
-    const name = getExtName(row);
-    if (!name) return;
+  const getByUuid =
+    nodeExtRepo && typeof nodeExtRepo.getExtensionByUuid === "function"
+      ? nodeExtRepo.getExtensionByUuid.bind(nodeExtRepo)
+      : null;
+  if (!getByUuid) fail("nodeExtensions.getExtensionByUuid missing");
 
-    const sets = parseTokenSets(
-      row && (row.tokenSets ?? row.token_sets ?? row.tokens ?? row.oauthTokens ?? row.oauthTokenSets)
-    );
+  const allSettings = await maybeAwait(settingsRepo.allNodeExtensionsSettings());
+  if (!Array.isArray(allSettings)) fail("settings.allNodeExtensionsSettings did not return array");
+  if (DEBUG) dbg("settings.allNodeExtensionsSettings rows=" + String(allSettings.length));
+
+  const tokens = {};
+  const prefs = {};
+
+  for (const row of allSettings) {
+    if (!row || typeof row !== "object") continue;
+    const uuid = row.id ?? row.uuid;
+    if (typeof uuid !== "string" || !uuid) continue;
+
+    let ext;
+    try {
+      ext = await maybeAwait(getByUuid(uuid));
+    } catch (err) {
+      if (DEBUG) dbg("getExtensionByUuid(" + uuid + ") failed: " + (err && err.message ? err.message : String(err)));
+      continue;
+    }
+
+    const name = ext && ext.name;
+    if (typeof name !== "string" || !name) continue;
+
+    const sets = normalizeTokenSets(row.oauthTokens ?? row.oauthTokenSets ?? row.tokenSets);
     if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
 
-    const p = parsePreferences(row && (row.preferences ?? row.prefs ?? row.userPreferences ?? row.storedValues));
+    const p = normalizePrefs(row.storedValues ?? row.preferences);
     if (p && Object.keys(p).length > 0) prefs[name] = p;
-  };
-
-  const exts = [];
-  for (const row of rows || []) {
-    if (!row || typeof row !== "object") continue;
-    exts.push({ id: row.id, name: row.name, uuid: row.uuid });
   }
 
-  function findExtensionBySettingsId(settingsId) {
-    if (typeof settingsId === "string") {
-      const s = settingsId.toLowerCase();
-      return exts.find((e) => e && typeof e.uuid === "string" && e.uuid.toLowerCase() === s) || null;
-    }
-    if (typeof settingsId === "number") {
-      return exts.find((e) => e && e.id === settingsId) || null;
-    }
-    return null;
-  }
-
-  function extractFromExtensionSettingsRow(row) {
-    if (!row || typeof row !== "object") return;
-    const settingsId = row.id ?? row.uuid ?? row.extensionUuid ?? row.extension_uuid;
-    const ext = findExtensionBySettingsId(settingsId);
-    if (!ext || !ext.name) return;
-
-    const sets = parseTokenSets(row.oauthTokens ?? row.oauthTokenSets ?? row.tokenSets);
-    if (sets && Array.isArray(sets) && sets.length > 0) tokens[ext.name] = sets;
-
-    const p = parsePreferences(row.storedValues ?? row.preferences);
-    if (p && Object.keys(p).length > 0) prefs[ext.name] = p;
-  }
-
-  // 1) Try extracting from the summary rows directly (in case a build includes these fields).
-  for (const row of rows || []) extractFromRow(row);
-
-  // 2) Enrich via getExtensionByDatabaseId when available.
-  if (getById) {
-    for (const row of rows || []) {
-      const id = row && row.id;
-      if (id == null) continue;
-      try {
-        const full = await maybeAwait(getById(id));
-        if (DEBUG && full && typeof full === "object") {
-          dbg("getExtensionByDatabaseId(" + String(id) + ") keys=" + Object.getOwnPropertyNames(full).join(","));
-        }
-        // Keep uuid if present.
-        try {
-          const name = getExtName(full);
-          const uuid = full && typeof full.uuid === "string" ? full.uuid : null;
-          if (name && uuid) {
-            const e = exts.find((x) => x && x.name === name);
-            if (e) e.uuid = uuid;
-          }
-        } catch {
-          // ignore
-        }
-        extractFromRow(full);
-      } catch (err) {
-        dbg(
-          "getExtensionByDatabaseId(" +
-            String(id) +
-            ") failed: " +
-            (err && err.message ? err.message : String(err))
-        );
-      }
-    }
-  }
-
-  // 3) Preferences/TokenSets may now live in settings/userDefaults repos rather than nodeExtensions rows.
-  const userDefaultsRepo = await callMaybe(client, "userDefaults");
-  const settingsRepo = await callMaybe(client, "settings");
-
-  const udAll = await tryRepoReadAll(userDefaultsRepo, "userDefaults");
-  if (DEBUG && udAll) {
-    if (Array.isArray(udAll)) {
-      dbg("userDefaults readAll -> array len=" + String(udAll.length));
-      if (udAll[0] && typeof udAll[0] === "object") dbg("userDefaults[0] keys=" + Object.getOwnPropertyNames(udAll[0]).join(","));
-    } else if (udAll && typeof udAll === "object") {
-      dbg("userDefaults readAll -> object keys=" + Object.keys(udAll).slice(0, 30).join(","));
-    }
-  }
-
-  const stAll = await tryRepoReadAll(settingsRepo, "settings");
-  if (DEBUG && stAll) {
-    if (Array.isArray(stAll)) {
-      dbg("settings readAll -> array len=" + String(stAll.length));
-      if (stAll[0] && typeof stAll[0] === "object") dbg("settings[0] keys=" + Object.getOwnPropertyNames(stAll[0]).join(","));
-    } else if (stAll && typeof stAll === "object") {
-      dbg("settings readAll -> object keys=" + Object.keys(stAll).slice(0, 30).join(","));
-    }
-  }
-
-  const ingestCollection = (coll) => {
-    if (!coll) return;
-    if (Array.isArray(coll)) {
-      for (const item of coll) {
-        // Try direct shapes first.
-        extractFromRow(item);
-        const kv = tryExtractFromKeyValue(exts, item);
-        if (kv && kv.kind === "tokens") tokens[kv.extName] = kv.value;
-        if (kv && kv.kind === "prefs") prefs[kv.extName] = kv.value;
-      }
-      return;
-    }
-
-    if (coll && typeof coll === "object") {
-      // Might be a key->value map.
-      for (const [k, v] of Object.entries(coll)) {
-        const ext = findExtensionForKey(exts, k);
-        if (!ext || !ext.name) continue;
-
-        const sets = parseTokenSets(v);
-        if (sets && sets.length > 0 && (looksLikeTokenSet(sets[0]) || looksLikeTokenSet(sets[sets.length - 1]))) {
-          tokens[ext.name] = sets;
-          continue;
-        }
-
-        const p = parsePreferences(v);
-        if (p && Object.keys(p).length > 0) {
-          prefs[ext.name] = p;
-        }
-      }
-    }
-  };
-
-  ingestCollection(udAll);
-  ingestCollection(stAll);
-
-  // 4) Pending tokens repository might now hold OAuth material.
-  const pendingRepo = await callMaybe(client, "pendingTokens");
-  if (pendingRepo) {
-    dbg("pendingTokens proto=" + protoKeys(pendingRepo).join(","));
-    // Try a few likely "read" methods if present.
-    await tryCall0(pendingRepo, "pendingTokens", "sanityCheck");
-    const ptAll =
-      (await tryCall0(pendingRepo, "pendingTokens", "all")) ||
-      (await tryCall0(pendingRepo, "pendingTokens", "getAll")) ||
-      (await tryCall0(pendingRepo, "pendingTokens", "allPendingTokens")) ||
-      (await tryCall0(pendingRepo, "pendingTokens", "getAllPendingTokens"));
-
-    // If it returns items, try extracting.
-    ingestCollection(ptAll);
-
-    // If repo exposes extension-scoped getters, try them for known uuids/ids.
-    for (const e of exts) {
-      if (!e) continue;
-      if (e.uuid) {
-        const byUuid =
-          (await tryCall1(pendingRepo, "pendingTokens", "getByExtensionUuid", e.uuid)) ||
-          (await tryCall1(pendingRepo, "pendingTokens", "getPendingTokensByExtensionUuid", e.uuid)) ||
-          (await tryCall1(pendingRepo, "pendingTokens", "getByUuid", e.uuid));
-        ingestCollection(byUuid);
-      }
-      if (e.id != null) {
-        const byId =
-          (await tryCall1(pendingRepo, "pendingTokens", "getByExtensionDatabaseId", e.id)) ||
-          (await tryCall1(pendingRepo, "pendingTokens", "getPendingTokensByExtensionDatabaseId", e.id)) ||
-          (await tryCall1(pendingRepo, "pendingTokens", "getById", e.id));
-        ingestCollection(byId);
-      }
-    }
-  }
-
-  // 5) Settings repository has explicit extension settings accessors.
-  if (settingsRepo) {
-    await tryCall0(settingsRepo, "settings", "sanityCheck");
-    const allNode = await tryCall0(settingsRepo, "settings", "allNodeExtensionsSettings");
-    if (Array.isArray(allNode)) {
-      for (const r of allNode) extractFromExtensionSettingsRow(r);
-    } else {
-      ingestCollection(allNode);
-    }
-
-    for (const e of exts) {
-      if (!e) continue;
-      if (e.uuid) {
-        const one = await tryCall1(settingsRepo, "settings", "getNodeExtensionSettings", e.uuid);
-        extractFromExtensionSettingsRow(one);
-      }
-    }
-  }
-
-  // 6) UserDefaults sanity check might expose counts/paths for debugging.
-  if (userDefaultsRepo) {
-    await tryCall0(userDefaultsRepo, "userDefaults", "sanityCheck");
-  }
-
-  // Best-effort: ask the backend to close gracefully so node.exe can exit promptly.
   try {
     if (client && typeof client.shutdown === "function") {
-      dbg("calling DatabaseClient.shutdown()");
+      if (DEBUG) dbg("calling DatabaseClient.shutdown()");
       await maybeAwait(client.shutdown());
     }
   } catch {
@@ -1254,6 +754,7 @@ async function main() {
 }
 
 main().catch((err) => fail(err && err.message ? err.message : String(err)));
+`.trim();
 `.trim();
 
   const res = spawnSync(backend.nodeExe, ["-e", script], {
