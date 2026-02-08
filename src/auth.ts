@@ -645,13 +645,9 @@ function createDbClient(binding, raycastDir, backendKey) {
     }
   }
 
-  const noopReport = () => {};
   const attempts = [
-    () => new C(raycastDir),
-    () => new C(raycastDir, noopReport),
-    () => new C(raycastDir, noopReport, backendKey),
-    () => new C(raycastDir, backendKey, noopReport),
     () => new C(raycastDir, backendKey),
+    () => new C(raycastDir),
     () => new C(),
   ];
 
@@ -765,49 +761,20 @@ async function getNodeExtensionsRows(client) {
   const repo = nodeExt;
   dbg("NodeExtensionsRepository proto=" + protoKeys(repo).join(","));
 
-  const preferred = [
-    "getAllExtensions",
-    "getInstalledExtensions",
-    "getExtensions",
-    "getAll",
-    "all",
-    "listAll",
-    "list",
-    "entries",
-  ];
-
-  for (const m of preferred) {
-    const fn = repo && repo[m];
-    if (typeof fn !== "function") continue;
-    try {
-      dbg("trying nodeExtensions." + m + "()");
-      const out = await maybeAwait(fn.call(repo));
-      const rows = pickRowsFromResult(out);
-      if (rows) return rows;
-    } catch (err) {
-      dbg("nodeExtensions." + m + " failed: " + (err && err.message ? err.message : String(err)));
-    }
+  // Known-good on current Windows builds: allExtensions()
+  const fn = repo && repo.allExtensions;
+  if (typeof fn !== "function") return null;
+  try {
+    dbg("trying nodeExtensions.allExtensions()");
+    const out = await maybeAwait(fn.call(repo));
+    const rows = pickRowsFromResult(out);
+    return rows || null;
+  } catch (err) {
+    dbg(
+      "nodeExtensions.allExtensions failed: " + (err && err.message ? err.message : String(err))
+    );
+    return null;
   }
-
-  // Fallback: try any safe-looking, zero-arg getter/list method.
-  const names = protoKeys(repo);
-  for (const m of names) {
-    if (!m) continue;
-    if (!/(get|list|all|fetch|load)/i.test(m)) continue;
-    if (/(set|delete|remove|drop|insert|update|write|save|create|reset|shutdown|restore|backup)/i.test(m)) continue;
-    const fn = repo[m];
-    if (typeof fn !== "function") continue;
-    try {
-      dbg("trying nodeExtensions." + m + "()");
-      const out = await maybeAwait(fn.call(repo));
-      const rows = pickRowsFromResult(out);
-      if (rows) return rows;
-    } catch (err) {
-      dbg("nodeExtensions." + m + " failed: " + (err && err.message ? err.message : String(err)));
-    }
-  }
-
-  return null;
 }
 
 async function main() {
@@ -898,15 +865,54 @@ async function main() {
     // ignore
   }
 
-  for (const row of rows || []) {
-    const name = getExtName(row);
-    if (!name) continue;
+  // The extension summary rows often do not include tokenSets/preferences.
+  // Fetch full extension records by DB id and pull secrets from there (best-effort).
+  const nodeExtRepo = await callMaybe(client, "nodeExtensions");
+  const getById =
+    nodeExtRepo && typeof nodeExtRepo.getExtensionByDatabaseId === "function"
+      ? nodeExtRepo.getExtensionByDatabaseId.bind(nodeExtRepo)
+      : null;
 
-    const sets = parseTokenSets(row && (row.tokenSets ?? row.token_sets ?? row.tokens ?? row.oauthTokens));
+  if (DEBUG) {
+    dbg("has getExtensionByDatabaseId=" + String(!!getById));
+  }
+
+  const extractFromRow = (row) => {
+    const name = getExtName(row);
+    if (!name) return;
+
+    const sets = parseTokenSets(
+      row && (row.tokenSets ?? row.token_sets ?? row.tokens ?? row.oauthTokens ?? row.oauthTokenSets)
+    );
     if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
 
     const p = parsePreferences(row && (row.preferences ?? row.prefs ?? row.userPreferences));
     if (p && Object.keys(p).length > 0) prefs[name] = p;
+  };
+
+  // 1) Try extracting from the summary rows directly (in case a build includes these fields).
+  for (const row of rows || []) extractFromRow(row);
+
+  // 2) Enrich via getExtensionByDatabaseId when available.
+  if (getById) {
+    for (const row of rows || []) {
+      const id = row && row.id;
+      if (id == null) continue;
+      try {
+        const full = await maybeAwait(getById(id));
+        if (DEBUG && full && typeof full === "object") {
+          dbg("getExtensionByDatabaseId(" + String(id) + ") keys=" + Object.getOwnPropertyNames(full).join(","));
+        }
+        extractFromRow(full);
+      } catch (err) {
+        dbg(
+          "getExtensionByDatabaseId(" +
+            String(id) +
+            ") failed: " +
+            (err && err.message ? err.message : String(err))
+        );
+      }
+    }
   }
 
   // Best-effort: ask the backend to close gracefully so node.exe can exit promptly.
