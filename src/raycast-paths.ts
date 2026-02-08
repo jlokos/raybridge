@@ -74,6 +74,23 @@ export function getRaycastExtensionsDir(): string {
   if (process.platform === "win32") {
     const a = join(homedir(), ".config", "raycast-x", "extensions");
     const b = join(homedir(), ".config", "raycast", "extensions");
+    const hasAnyExtension = (dir: string): boolean => {
+      try {
+        if (!existsSync(dir)) return false;
+        const entries = readdirSync(dir, { withFileTypes: true } as any);
+        for (const ent of entries) {
+          if (!ent?.isDirectory?.()) continue;
+          const pkg = join(dir, ent.name, "package.json");
+          if (existsSync(pkg)) return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    if (hasAnyExtension(a)) return a;
+    if (hasAnyExtension(b)) return b;
     if (existsSync(a)) return a;
     if (existsSync(b)) return b;
     return a;

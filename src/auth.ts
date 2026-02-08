@@ -523,67 +523,71 @@ function listDbFiles(dir) {
   }
 }
 
-function tryOpenWithBinding(dbPath, backendKey) {
+function loadBinding() {
   const bindingPath = path.join(process.cwd(), "data.win32-x64-msvc.node");
-  if (!fs.existsSync(bindingPath)) return null;
-
+  if (!fs.existsSync(bindingPath)) fail("missing backend binding: " + bindingPath);
   let binding;
-  try { binding = require(bindingPath); } catch { return null; }
+  try {
+    binding = require(bindingPath);
+  } catch (err) {
+    fail("could not require binding: " + (err && err.message ? err.message : String(err)));
+  }
   dbg("binding keys=" + Object.keys(binding || {}).join(","));
-
-  const Database =
-    (binding && (binding.Database || binding.default)) ||
-    (typeof binding === "function" ? binding : null);
-  if (typeof Database !== "function") {
-    dbg("binding Database export not found");
-    return null;
-  }
-
-  let db;
-  try {
-    db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  } catch {
-    try { db = new Database(dbPath); } catch { dbg("open failed"); return null; }
-  }
-
-  try {
-    const escaped = String(backendKey).replace(/'/g, "''");
-    const pragmaArg = "key='" + escaped + "'";
-    if (db && typeof db.pragma === "function") db.pragma(pragmaArg);
-    if (db && typeof db.exec === "function") db.exec("PRAGMA " + pragmaArg + ";");
-    if (db && typeof db.run === "function") db.run("PRAGMA " + pragmaArg + ";");
-    if (db && typeof db.key === "function") db.key(String(backendKey));
-  } catch {
-    // ignore
-  }
-
-  return db;
+  return binding;
 }
 
-function hasExtensionsTable(db) {
-  try {
-    if (!db) return false;
-    if (typeof db.prepare !== "function") { dbg("db.prepare missing"); return false; }
-    const stmt = db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions'");
-    let row = null;
-    if (stmt && typeof stmt.get === "function") row = stmt.get();
-    else if (stmt && typeof stmt.all === "function") row = (stmt.all() || [])[0];
-    return !!row && Number(row.c) > 0;
-  } catch {
-    // ignore
-  }
-  return false;
+async function maybeAwait(v) {
+  if (v && typeof v.then === "function") return await v;
+  return v;
 }
 
-function queryExtensions(db) {
-  if (typeof db.prepare !== "function") return [];
-  try {
-    return db.prepare(
-      "SELECT name, tokenSets, preferences FROM extensions WHERE (tokenSets IS NOT NULL AND tokenSets != '') OR (preferences IS NOT NULL AND preferences != '')"
-    ).all();
-  } catch {
-    return [];
+function firstRows(res) {
+  if (Array.isArray(res)) return res;
+  if (res && Array.isArray(res.rows)) return res.rows;
+  if (res && Array.isArray(res.result)) return res.result;
+  return null;
+}
+
+async function tryQuery(target, dbId, sql) {
+  if (!target) return null;
+
+  const methods = [
+    "query",
+    "queryRaw",
+    "rawQuery",
+    "select",
+    "all",
+    "execute",
+    "run",
+  ];
+
+  const variants = [
+    [dbId, sql],
+    [sql, dbId],
+    [{ dbPath: dbId, sql }],
+    [{ databasePath: dbId, sql }],
+    [{ path: dbId, sql }],
+    [{ database: dbId, sql }],
+    [{ kind: dbId, sql }],
+    [{ dbKind: dbId, sql }],
+    [{ databaseKind: dbId, sql }],
+    [dbId, sql, []],
+  ];
+
+  for (const m of methods) {
+    const fn = target[m];
+    if (typeof fn !== "function") continue;
+    for (const args of variants) {
+      try {
+        const out = await maybeAwait(fn.apply(target, args));
+        const rows = firstRows(out);
+        if (rows) return rows;
+      } catch (err) {
+        dbg(m + " failed: " + (err && err.message ? err.message : String(err)));
+      }
+    }
   }
+  return null;
 }
 
 function parsePreferences(prefJson) {
@@ -605,7 +609,48 @@ function parseTokenSets(tokenJson) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-function main() {
+function createDbClient(binding, raycastDir, backendKey) {
+  const C = binding && binding.DatabaseClient;
+  if (typeof C !== "function") return null;
+
+  if (DEBUG) {
+    try {
+      dbg("DatabaseClient proto=" + Object.getOwnPropertyNames(C.prototype || {}).join(","));
+    } catch {
+      // ignore
+    }
+  }
+
+  const attempts = [
+    () => new C({ raycastDir, backendKey }),
+    () => new C({ dataDir: raycastDir, backendKey }),
+    () => new C({ dataDir: raycastDir, key: backendKey }),
+    () => new C(raycastDir, backendKey),
+    () => new C(backendKey, raycastDir),
+    () => new C(),
+  ];
+
+  for (const mk of attempts) {
+    try {
+      const client = mk();
+      if (!client) continue;
+      try {
+        if (typeof client.setKey === "function") client.setKey(backendKey);
+        if (typeof client.key === "function") client.key(backendKey);
+      } catch {
+        // ignore
+      }
+      return client;
+    } catch (err) {
+      dbg("DatabaseClient ctor failed: " + (err && err.message ? err.message : String(err)));
+      continue;
+    }
+  }
+
+  return null;
+}
+
+async function main() {
   const raycastDir = process.env.RAYCAST_DIR;
   const backendKey = process.env.RAYCAST_BACKEND_DB_KEY;
   if (!raycastDir) fail("RAYCAST_DIR is required");
@@ -616,20 +661,58 @@ function main() {
   dbg("dbFiles=" + dbFiles.map((p) => path.basename(p)).join(","));
   if (dbFiles.length === 0) fail("no DB files found under " + raycastDir);
 
-  let db = null;
+  const binding = loadBinding();
+
+  const client = createDbClient(binding, raycastDir, backendKey);
+  if (!client) fail("could not create DatabaseClient");
+
+  const probeSql =
+    "SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions';";
+  const dataSql =
+    "SELECT name, tokenSets, preferences FROM extensions " +
+    "WHERE (tokenSets IS NOT NULL AND tokenSets != '') " +
+    "OR (preferences IS NOT NULL AND preferences != '');";
+
+  let rows = null;
+
+  // Attempt 1: query by DB file path.
   for (const dbPath of dbFiles) {
-    dbg("trying db=" + path.basename(dbPath));
-    const candidate = tryOpenWithBinding(dbPath, backendKey);
-    if (!candidate) continue;
-    const ok = hasExtensionsTable(candidate);
+    dbg("trying dbPath=" + path.basename(dbPath));
+    const probeRows = await tryQuery(client, dbPath, probeSql);
+    const ok = probeRows && probeRows[0] && Number(probeRows[0].c) > 0;
     dbg("hasExtensionsTable=" + ok);
-    if (ok) { db = candidate; break; }
-    try { if (candidate && typeof candidate.close === "function") candidate.close(); } catch {}
+    if (!ok) continue;
+    rows = await tryQuery(client, dbPath, dataSql);
+    if (rows) break;
   }
 
-  if (!db) fail("could not open any Raycast DB with extensions table");
+  // Attempt 2: query by DatabaseKind.
+  if (!rows && binding && binding.DatabaseKind && typeof binding.DatabaseKind === "object") {
+    const kinds = [];
+    try {
+      for (const [k, v] of Object.entries(binding.DatabaseKind)) {
+        if (/^\\d+$/.test(k)) continue;
+        kinds.push([k, v]);
+      }
+    } catch {
+      // ignore
+    }
 
-  const rows = queryExtensions(db);
+    dbg("DatabaseKind keys=" + kinds.map((kv) => kv[0]).join(","));
+
+    for (const [k, v] of kinds) {
+      dbg("trying kind=" + k);
+      const probeRows = await tryQuery(client, v, probeSql);
+      const ok = probeRows && probeRows[0] && Number(probeRows[0].c) > 0;
+      dbg("hasExtensionsTable=" + ok);
+      if (!ok) continue;
+      rows = await tryQuery(client, v, dataSql);
+      if (rows) break;
+    }
+  }
+
+  if (!rows) fail("could not open any Raycast DB with extensions table");
+
   const tokens = {};
   const prefs = {};
 
@@ -650,7 +733,7 @@ function main() {
   process.stdout.write(JSON.stringify({ tokens, prefs }));
 }
 
-main();
+main().catch((err) => fail(err && err.message ? err.message : String(err)));
 `.trim();
 
   const res = spawnSync(backend.nodeExe, ["-e", script], {
