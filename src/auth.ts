@@ -937,6 +937,11 @@ main().catch((err) => fail(err && err.message ? err.message : String(err)));
   });
 
   if (res.error) throw res.error;
+  // In debug mode, surface the backend's stderr even on success.
+  if (process.env.RAYBRIDGE_DEBUG_WINDOWS_BACKEND === "1") {
+    const dbg = (res.stderr || "").trimEnd();
+    if (dbg) console.error(dbg);
+  }
   if (res.status !== 0) {
     const err = (res.stderr || res.stdout || "").trim();
     throw new Error(err || `raycast backend dump failed (exit ${res.status})`);
