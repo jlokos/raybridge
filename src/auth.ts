@@ -755,7 +755,6 @@ async function main() {
 
 main().catch((err) => fail(err && err.message ? err.message : String(err)));
 `.trim();
-`.trim();
 
   const res = spawnSync(backend.nodeExe, ["-e", script], {
     cwd: backend.backendDir,
