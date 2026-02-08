@@ -645,16 +645,24 @@ function createDbClient(binding, raycastDir, backendKey) {
     }
   }
 
-  const attempts = [
-    () => new C(raycastDir, backendKey),
-    () => new C(raycastDir),
-    () => new C(),
+  const noopReport = () => {};
+  const attempts: Array<[string, () => any]> = [
+    ["(raycastDir, noopReport)", () => new C(raycastDir, noopReport)],
+    ["(raycastDir, backendKey)", () => new C(raycastDir, backendKey)],
+    ["(raycastDir, noopReport, backendKey)", () => new C(raycastDir, noopReport, backendKey)],
+    ["(raycastDir, backendKey, noopReport)", () => new C(raycastDir, backendKey, noopReport)],
+    ["({ raycastDir, backendKey })", () => new C({ raycastDir, backendKey })],
+    ["({ dataDir: raycastDir, backendKey })", () => new C({ dataDir: raycastDir, backendKey })],
+    ["({ dataDir: raycastDir, key: backendKey })", () => new C({ dataDir: raycastDir, key: backendKey })],
+    ["(raycastDir)", () => new C(raycastDir)],
+    ["()", () => new C()],
   ];
 
-  for (const mk of attempts) {
+  for (const [label, mk] of attempts) {
     try {
       const client = mk();
       if (!client) continue;
+      dbg("DatabaseClient ctor ok: " + label);
       return client;
     } catch (err) {
       dbg("DatabaseClient ctor failed: " + (err && err.message ? err.message : String(err)));
