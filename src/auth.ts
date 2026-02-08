@@ -42,6 +42,18 @@ export interface RaycastAuthData {
 
 const emptyAuthData = (): RaycastAuthData => ({ tokens: new Map(), prefs: {} });
 
+let lastWindowsAuthFailure: { atMs: number; reason: string } | null = null;
+function logWindowsAuthFailure(reason: string) {
+  const now = Date.now();
+  const r = (reason || "unknown").trim() || "unknown";
+  // Avoid spamming the same message on rapid reloads.
+  if (lastWindowsAuthFailure && lastWindowsAuthFailure.reason === r && now - lastWindowsAuthFailure.atMs < 10_000) {
+    return;
+  }
+  lastWindowsAuthFailure = { atMs: now, reason: r };
+  console.error(`raybridge: Windows OAuth load failed: ${r}`);
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -50,9 +62,13 @@ export async function loadRaycastAuthData(): Promise<RaycastAuthData> {
   if (process.platform === "win32") {
     try {
       const data = await loadRaycastAuthDataWindowsBackend();
-      return data ?? emptyAuthData();
+      if (!data) {
+        logWindowsAuthFailure("unknown (backend path returned null)");
+        return emptyAuthData();
+      }
+      return data;
     } catch (err: any) {
-      console.error(`raybridge: Windows OAuth load failed: ${err?.message || String(err)}`);
+      logWindowsAuthFailure(err?.message || String(err));
       return emptyAuthData();
     }
   }
@@ -485,12 +501,20 @@ async function loadRaycastAuthDataWindowsBackend(): Promise<RaycastAuthData | nu
         "raybridge: Windows BackendDBKey not found. Open Raycast once and sign in; then re-run."
       );
     }
+    // Continue anyway: some builds may not require the key for reading some DBs,
+    // and we can at least emit better debug output.
   }
 
   const backend = ensureRaycastBackendCopy();
-  if (!backend) return null;
+  if (!backend) {
+    throw new Error("could not locate/copy Raycast backend runtime (AppX package Raycast.Raycast)");
+  }
 
   const dataDir = getRaycastDataDir();
+  if (!dataDir) throw new Error("could not resolve Raycast data dir");
+  if (!existsSync(dataDir)) {
+    throw new Error(`Raycast data dir does not exist: ${dataDir}`);
+  }
 
   const script = `
 const fs = require("node:fs");
