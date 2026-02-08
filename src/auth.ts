@@ -651,7 +651,6 @@ function createDbClient(binding, raycastDir, backendKey) {
     ["(raycastDir, noopReport)", () => new C(raycastDir, noopReport)],
     ["(raycastDir, backendKey)", () => new C(raycastDir, backendKey)],
     ["(raycastDir, noopReport, backendKey)", () => new C(raycastDir, noopReport, backendKey)],
-    ["(raycastDir, backendKey, noopReport)", () => new C(raycastDir, backendKey, noopReport)],
     ["({ raycastDir, backendKey })", () => new C({ raycastDir, backendKey })],
     ["({ dataDir: raycastDir, backendKey })", () => new C({ dataDir: raycastDir, backendKey })],
     ["({ dataDir: raycastDir, key: backendKey })", () => new C({ dataDir: raycastDir, key: backendKey })],
@@ -759,6 +758,29 @@ function pickRowsFromResult(res) {
   return null;
 }
 
+function logShape(label, out) {
+  if (!DEBUG) return;
+  try {
+    if (Array.isArray(out)) {
+      dbg(label + " -> array len=" + String(out.length));
+      if (out[0] && typeof out[0] === "object") {
+        dbg(label + "[0] keys=" + Object.getOwnPropertyNames(out[0]).join(","));
+      } else if (out.length > 0) {
+        dbg(label + "[0] typeof=" + typeof out[0]);
+      }
+      return;
+    }
+    if (out && typeof out === "object") {
+      const keys = Object.keys(out);
+      dbg(label + " -> object keys=" + keys.slice(0, 30).join(",") + (keys.length > 30 ? ",..." : ""));
+      return;
+    }
+    dbg(label + " -> typeof=" + typeof out);
+  } catch {
+    // ignore
+  }
+}
+
 function looksLikeTokenSet(obj) {
   if (!obj || typeof obj !== "object") return false;
   return typeof obj.accessToken === "string" || typeof obj.refreshToken === "string" || typeof obj.idToken === "string";
@@ -833,6 +855,36 @@ async function tryRepoReadAll(repo, label) {
   }
 
   return null;
+}
+
+async function tryCall0(obj, label, methodName) {
+  if (!obj) return null;
+  const fn = obj[methodName];
+  if (typeof fn !== "function") return null;
+  try {
+    dbg("trying " + label + "." + methodName + "()");
+    const out = await maybeAwait(fn.call(obj));
+    logShape(label + "." + methodName, out);
+    return out;
+  } catch (err) {
+    dbg(label + "." + methodName + " failed: " + (err && err.message ? err.message : String(err)));
+    return null;
+  }
+}
+
+async function tryCall1(obj, label, methodName, arg) {
+  if (!obj) return null;
+  const fn = obj[methodName];
+  if (typeof fn !== "function") return null;
+  try {
+    dbg("trying " + label + "." + methodName + "(" + String(arg) + ")");
+    const out = await maybeAwait(fn.call(obj, arg));
+    logShape(label + "." + methodName, out);
+    return out;
+  } catch (err) {
+    dbg(label + "." + methodName + " failed: " + (err && err.message ? err.message : String(err)));
+    return null;
+  }
 }
 
 async function getNodeExtensionsRows(client) {
@@ -1076,6 +1128,68 @@ async function main() {
 
   ingestCollection(udAll);
   ingestCollection(stAll);
+
+  // 4) Pending tokens repository might now hold OAuth material.
+  const pendingRepo = await callMaybe(client, "pendingTokens");
+  if (pendingRepo) {
+    dbg("pendingTokens proto=" + protoKeys(pendingRepo).join(","));
+    // Try a few likely "read" methods if present.
+    await tryCall0(pendingRepo, "pendingTokens", "sanityCheck");
+    const ptAll =
+      (await tryCall0(pendingRepo, "pendingTokens", "all")) ||
+      (await tryCall0(pendingRepo, "pendingTokens", "getAll")) ||
+      (await tryCall0(pendingRepo, "pendingTokens", "allPendingTokens")) ||
+      (await tryCall0(pendingRepo, "pendingTokens", "getAllPendingTokens"));
+
+    // If it returns items, try extracting.
+    ingestCollection(ptAll);
+
+    // If repo exposes extension-scoped getters, try them for known uuids/ids.
+    for (const e of exts) {
+      if (!e) continue;
+      if (e.uuid) {
+        const byUuid =
+          (await tryCall1(pendingRepo, "pendingTokens", "getByExtensionUuid", e.uuid)) ||
+          (await tryCall1(pendingRepo, "pendingTokens", "getPendingTokensByExtensionUuid", e.uuid)) ||
+          (await tryCall1(pendingRepo, "pendingTokens", "getByUuid", e.uuid));
+        ingestCollection(byUuid);
+      }
+      if (e.id != null) {
+        const byId =
+          (await tryCall1(pendingRepo, "pendingTokens", "getByExtensionDatabaseId", e.id)) ||
+          (await tryCall1(pendingRepo, "pendingTokens", "getPendingTokensByExtensionDatabaseId", e.id)) ||
+          (await tryCall1(pendingRepo, "pendingTokens", "getById", e.id));
+        ingestCollection(byId);
+      }
+    }
+  }
+
+  // 5) Settings repository has explicit extension settings accessors.
+  if (settingsRepo) {
+    await tryCall0(settingsRepo, "settings", "sanityCheck");
+    const allNode =
+      (await tryCall0(settingsRepo, "settings", "allNodeExtensionsSettings")) ||
+      (await tryCall0(settingsRepo, "settings", "allInternalExtensionsSettings")) ||
+      (await tryCall0(settingsRepo, "settings", "allCommandSettings"));
+    ingestCollection(allNode);
+
+    for (const e of exts) {
+      if (!e) continue;
+      if (e.uuid) {
+        const one = await tryCall1(settingsRepo, "settings", "getNodeExtensionSettings", e.uuid);
+        ingestCollection(one);
+      }
+      if (e.id != null) {
+        const one = await tryCall1(settingsRepo, "settings", "getNodeExtensionSettings", e.id);
+        ingestCollection(one);
+      }
+    }
+  }
+
+  // 6) UserDefaults sanity check might expose counts/paths for debugging.
+  if (userDefaultsRepo) {
+    await tryCall0(userDefaultsRepo, "userDefaults", "sanityCheck");
+  }
 
   // Best-effort: ask the backend to close gracefully so node.exe can exit promptly.
   try {
