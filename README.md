@@ -8,11 +8,19 @@ Discovers locally installed Raycast extensions, loads their tool definitions, an
 
 ## How it works
 
-1. Scans `~/.config/raycast/extensions/` for installed extensions with `tools` definitions
+1. Scans Raycast's local extensions directory for installed extensions with `tools` definitions (macOS: `~/.config/raycast/extensions/`, Windows: `~/.config/raycast-x/extensions/`)
 2. Loads OAuth tokens from Raycast's encrypted SQLite database
 3. Registers tools as MCP tools accessible to any MCP client
 
 Extensions that use Raycast UI APIs (`List`, `Detail`, `Form`, etc.) are supported — the UI components are shimmed to no-ops so the underlying tool logic can execute headlessly. Extensions whose tools perform background work (API calls, data lookups, transformations) work best.
+
+## Security
+
+- RayBridge can access **OAuth refresh tokens** stored by Raycast for installed extensions.
+- RayBridge is **local-only by default**: HTTP binds to `127.0.0.1` unless you explicitly set `--host` / `MCP_HOST`.
+- RayBridge does **not** collect or transmit tokens anywhere.
+- RayBridge avoids logging tool outputs, and redacts token-like values in error/input logs (defense-in-depth).
+- Do not run RayBridge on shared accounts. If you bind HTTP to a non-loopback host, use firewall rules.
 
 ## Setup
 
@@ -20,7 +28,13 @@ Extensions that use Raycast UI APIs (`List`, `Detail`, `Form`, etc.) are support
 
 - [Bun](https://bun.sh)
 - [Raycast](https://raycast.com) installed with extensions
-- `sqlcipher` CLI (for OAuth token access): `brew install sqlcipher`
+- Windows: Raycast has been opened at least once, and you're signed in
+- The extension OAuth flow must have been completed inside Raycast (for extensions that use OAuth)
+- macOS: `sqlcipher` on PATH (or set `RAYBRIDGE_SQLCIPHER_PATH`) for OAuth token access
+
+### DB access environment variables
+
+- `RAYBRIDGE_SQLCIPHER_PATH`: use a specific `sqlcipher` binary (macOS only)
 
 ### Install
 
@@ -65,17 +79,20 @@ The server can also run as an HTTP server for remote MCP clients.
 **Start the server:**
 
 ```bash
-# Default: http://0.0.0.0:3000
+# Default (recommended): http://127.0.0.1:3000
 bun run start:http
 
 # Custom host/port
-MCP_PORT=8080 MCP_HOST=0.0.0.0 bun run start:http
+MCP_PORT=8080 MCP_HOST=127.0.0.1 bun run start:http
+
+# Bind to all interfaces (NOT recommended; prints a loud warning)
+MCP_HOST=0.0.0.0 bun run start:http
 
 # With API key authentication
 MCP_API_KEY=your-secret-key bun run start:http
 
 # CLI flags also work
-bun run src/index.ts --http --port 8080 --host 0.0.0.0
+bun run src/index.ts --http --port 8080 --host 127.0.0.1
 ```
 
 **Endpoints:**
@@ -129,6 +146,25 @@ curl -X POST http://127.0.0.1:3000/mcp \
 ```
 
 Sessions auto-expire after 30 minutes of inactivity.
+
+## Troubleshooting
+
+- `bun run debug:keys` (Windows): shows whether `BackendDBKey` sources exist (Credential Manager, `last_key`)
+- `bun run debug:auth`: prints counts (`oauth token sets` and `preferences`)
+
+### Windows backend access (Raycast runtime)
+
+On Windows, RayBridge can copy Raycast's backend runtime from your local Raycast installation into a per-user cache and use it to query Raycast's encrypted DBs via Raycast's own native binding. RayBridge does not ship Raycast binaries. This relies on Raycast internals and may break when Raycast updates.
+
+Environment variables:
+- `RAYBRIDGE_RAYCAST_BACKEND_CACHE_DIR`: override the per-user Raycast backend cache directory
+- `RAYBRIDGE_RAYCAST_BACKEND_CACHE_KEEP`: how many cached versions to keep (default: 2)
+- `RAYBRIDGE_DISABLE_RAYCAST_BACKEND=1`: disable the Windows backend path (Windows OAuth tokens/prefs will not load)
+
+Common errors:
+- `Windows BackendDBKey not found`: open Raycast once, sign in, then re-run
+- `Database not initialized` / `no such table`: Raycast not opened, or DB format changed
+ - `sqlcipher exited ...`: ensure `sqlcipher` is installed (macOS) or set `RAYBRIDGE_SQLCIPHER_PATH`
 
 ## CLI
 
@@ -201,7 +237,7 @@ src/
 ├── cli.ts         # CLI entry point (config, list, help commands)
 ├── tui.tsx        # Interactive TUI for extension configuration
 ├── config.ts      # Tools configuration (blocklist/allowlist)
-├── discovery.ts   # Scans ~/.config/raycast/extensions/ for tool definitions
+├── discovery.ts   # Scans Raycast's extensions directory for tool definitions
 ├── loader.ts      # Executes local tools with Raycast API shims
 ├── shims.ts       # Fake @raycast/api, react, react/jsx-runtime modules
 ├── auth.ts        # Keychain access, SQLcipher DB decryption, OAuth tokens
@@ -210,7 +246,13 @@ src/
 
 ### Tool discovery
 
-Local extensions are discovered from `~/.config/raycast/extensions/`. Each extension's `package.json` must have a `tools` array defining available tools with names, descriptions, and input schemas. Compiled tool code lives at `tools/{toolName}.js` within each extension directory.
+Local extensions are discovered from Raycast's extensions directory:
+- macOS: `~/.config/raycast/extensions/`
+- Windows: `~/.config/raycast-x/extensions/`
+
+Override with `RAYBRIDGE_RAYCAST_EXTENSIONS_DIR` if your Raycast install uses a different location.
+
+Each extension's `package.json` must have a `tools` array defining available tools with names, descriptions, and input schemas. Compiled tool code lives at `tools/{toolName}.js` within each extension directory.
 
 When duplicates exist (same extension name in multiple directories), the most recently modified version wins.
 
@@ -242,10 +284,22 @@ React and JSX runtime are also shimmed with minimal mocks (`createElement` → `
 OAuth tokens are read from Raycast's encrypted SQLite database at:
 
 ```
-~/Library/Application Support/com.raycast.macos/raycast-enc.sqlite
+macOS: ~/Library/Application Support/com.raycast.macos/raycast-enc.sqlite
+Windows: %LOCALAPPDATA%\\Raycast\\main.db (and related *.db files)
 ```
 
-The database key is retrieved from macOS Keychain and derived with a salt via SHA256. Tokens are extracted per-extension and provided to tools through the `OAuth.PKCEClient` shim.
+Override with `RAYBRIDGE_RAYCAST_DATA_DIR` if Raycast stores data elsewhere on your machine.
+
+The database key is retrieved from:
+- macOS Keychain (`security find-generic-password ...`) and derived with a salt via SHA256
+- Windows Credential Manager (`Raycast-Production/BackendDBKey`) and/or `%LOCALAPPDATA%\\Raycast\\last_key`
+
+Tokens are extracted per-extension and provided to tools through the `OAuth.PKCEClient` shim.
+
+### What data is read?
+
+- Extension settings stored by Raycast (includes OAuth token sets)
+- Extension preferences (Raycast's own per-extension preference storage)
 
 ## MCP tool schema
 
@@ -265,4 +319,4 @@ Tool descriptions include per-tool documentation, parameter details, and any ext
 - **No interactive UI** — extensions that depend on rendering Lists, Forms, or other visual components to the user won't behave meaningfully
 - **No persistent LocalStorage** — shimmed as no-op; extensions relying on it lose state between calls
 - **OAuth tokens are not refreshed** — expired tokens will cause failures until Raycast refreshes them
-- **macOS only** — depends on macOS Keychain and Raycast's macOS app paths
+- **Platform support** — macOS and Windows are supported; Linux is untested and will likely require configuring Raycast paths and DB key access

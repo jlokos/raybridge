@@ -10,9 +10,10 @@ import { homedir } from "node:os";
 import { discoverExtensions, type ExtensionEntry } from "./discovery.js";
 import { executeTool } from "./loader.js";
 import { setPreferences, setRaycastTokens } from "./shims.js";
-import { loadRaycastTokens, loadRaycastPreferences } from "./auth.js";
+import { loadRaycastAuthData } from "./auth.js";
 import { loadToolsConfig, filterExtensions } from "./config.js";
 import { startExtensionWatcher } from "./watcher.js";
+import { redactSecrets } from "./redact.js";
 
 export interface ToolDef {
   name: string;
@@ -169,7 +170,7 @@ export function createMcpServer(ctx: ServerContext): Server {
     }
 
     const tool = entry.ext.tools[entry.toolIndex];
-    const inputSummary = JSON.stringify(args.input || {}).slice(0, 200);
+    const inputSummary = redactSecrets(JSON.stringify(args.input || {}).slice(0, 200));
     const startTime = Date.now();
 
     console.error(`raybridge: [CALL] ${extName}/${args.tool_name} input=${inputSummary}`);
@@ -182,17 +183,19 @@ export function createMcpServer(ctx: ServerContext): Server {
         entry.ext.extensionDir
       );
       const duration = Date.now() - startTime;
-      const resultPreview = result.slice(0, 100).replace(/\n/g, "\\n");
-      console.error(`raybridge: [OK] ${extName}/${args.tool_name} (${duration}ms) result=${resultPreview}...`);
+      // Never log tool outputs (they may contain OAuth tokens or other secrets).
+      console.error(`raybridge: [OK] ${extName}/${args.tool_name} (${duration}ms)`);
       return { content: [{ type: "text" as const, text: result }] };
     } catch (err: any) {
       const duration = Date.now() - startTime;
-      const msg = err.message || String(err);
-      console.error(`raybridge: [ERR] ${extName}/${args.tool_name} (${duration}ms) error=${msg.slice(0, 150)}`);
+      const msg = redactSecrets(err?.message || String(err));
+      console.error(
+        `raybridge: [ERR] ${extName}/${args.tool_name} (${duration}ms) error=${msg.slice(0, 150)}`
+      );
       const isAuthError =
         /token|oauth|unauthorized|403|401|invalid_grant|Missing required parameter: code/i.test(msg);
       const text = isAuthError
-        ? `OAuth error for ${extName}/${args.tool_name}: ${msg}\n\nThis extension requires OAuth authentication managed by Raycast. The tokens are stored in Raycast's encrypted database and cannot be accessed externally.\n\nWorkaround: If this extension supports personal access tokens, add them to ~/.config/raybridge/preferences.json:\n{\n  "${extName}": { "personalAccessToken": "your-token-here" }\n}`
+        ? `OAuth error for ${extName}/${args.tool_name}: ${msg}\n\nThis extension requires OAuth authentication managed by Raycast. The tokens are stored in Raycast's encrypted database and cannot be accessed externally.\n\nWorkaround: If this extension supports personal access tokens, add them to ${join(homedir(), ".config", "raybridge", "preferences.json")}:\n{\n  "${extName}": { "personalAccessToken": "your-token-here" }\n}`
         : `Error: ${msg}`;
       return {
         content: [{ type: "text" as const, text }],
@@ -208,7 +211,8 @@ function parseArgs(): { http: boolean; port: number; host: string } {
   const args = process.argv.slice(2);
   let http = process.env.MCP_HTTP === "true";
   let port = parseInt(process.env.MCP_PORT || "3000", 10);
-  let host = process.env.MCP_HOST || "0.0.0.0";
+  // Secure-by-default: bind only to loopback unless the user explicitly opts into remote exposure.
+  let host = process.env.MCP_HOST || "127.0.0.1";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--http") {
@@ -236,35 +240,27 @@ export async function loadServerContext(): Promise<ServerContext> {
     loadToolsConfig(),
   ]);
 
-  // Load preferences from Raycast's encrypted database and merge with manual prefs
-  // Manual prefs override Raycast prefs
-  let mergedPrefs = { ...manualPrefs };
+  // Load Raycast auth data once (tokens + prefs), then merge with manual prefs.
+  let auth = { tokens: new Map(), prefs: {} as Record<string, Record<string, unknown>> };
   try {
-    const raycastPrefs = loadRaycastPreferences();
-    for (const [extName, extPrefs] of Object.entries(raycastPrefs)) {
-      mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
-    }
-    const prefsCount = Object.keys(raycastPrefs).length;
-    if (prefsCount > 0) {
-      console.error(
-        `raybridge: Loaded preferences for ${prefsCount} extensions from Raycast DB`
-      );
-    }
+    auth = await loadRaycastAuthData();
   } catch (err: any) {
-    console.error(`raybridge: Could not load Raycast preferences: ${err.message}`);
+    console.error(`raybridge: Could not load Raycast auth data: ${err?.message || String(err)}`);
+  }
+
+  // Manual prefs override Raycast prefs per extension.
+  const mergedPrefs: Record<string, Record<string, unknown>> = { ...manualPrefs };
+  for (const [extName, extPrefs] of Object.entries(auth.prefs || {})) {
+    mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
   }
   setPreferences(mergedPrefs);
 
-  // Load OAuth tokens from Raycast's encrypted database
-  try {
-    const raycastTokens = loadRaycastTokens();
-    setRaycastTokens(raycastTokens);
-    console.error(
-      `raybridge: Loaded OAuth tokens for ${raycastTokens.size} extensions`
-    );
-  } catch (err: any) {
-    console.error(`raybridge: Could not load OAuth tokens: ${err.message}`);
+  setRaycastTokens(auth.tokens || new Map());
+  const prefsCount = Object.keys(auth.prefs || {}).length;
+  if (prefsCount > 0) {
+    console.error(`raybridge: Loaded preferences for ${prefsCount} extensions from Raycast DB`);
   }
+  console.error(`raybridge: Loaded OAuth tokens for ${(auth.tokens || new Map()).size} extensions`);
 
   const extensions = filterExtensions(localExtensions, toolsConfig);
 
@@ -294,34 +290,23 @@ export async function reloadServerContext(ctx: ServerContext): Promise<boolean> 
     loadToolsConfig(),
   ]);
 
-  // Reload preferences from Raycast DB
-  let mergedPrefs = { ...manualPrefs };
+  let auth = { tokens: new Map(), prefs: {} as Record<string, Record<string, unknown>> };
   try {
-    const raycastPrefs = loadRaycastPreferences();
-    for (const [extName, extPrefs] of Object.entries(raycastPrefs)) {
-      mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
-    }
-    const prefsCount = Object.keys(raycastPrefs).length;
-    if (prefsCount > 0) {
-      console.error(
-        `raybridge: Reloaded preferences for ${prefsCount} extensions`
-      );
-    }
+    auth = await loadRaycastAuthData();
   } catch (err: any) {
-    console.error(`raybridge: Could not reload Raycast preferences: ${err.message}`);
+    console.error(`raybridge: Could not reload Raycast auth data: ${err?.message || String(err)}`);
+  }
+
+  const mergedPrefs: Record<string, Record<string, unknown>> = { ...manualPrefs };
+  for (const [extName, extPrefs] of Object.entries(auth.prefs || {})) {
+    mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
   }
   setPreferences(mergedPrefs);
 
-  // Reload OAuth tokens from Raycast DB
-  try {
-    const raycastTokens = loadRaycastTokens();
-    setRaycastTokens(raycastTokens);
-    console.error(
-      `raybridge: Reloaded OAuth tokens for ${raycastTokens.size} extensions`
-    );
-  } catch (err: any) {
-    console.error(`raybridge: Could not reload OAuth tokens: ${err.message}`);
-  }
+  setRaycastTokens(auth.tokens || new Map());
+  const prefsCount = Object.keys(auth.prefs || {}).length;
+  if (prefsCount > 0) console.error(`raybridge: Reloaded preferences for ${prefsCount} extensions`);
+  console.error(`raybridge: Reloaded OAuth tokens for ${(auth.tokens || new Map()).size} extensions`);
 
   const extensions = filterExtensions(localExtensions, toolsConfig);
   const { tools, lookup } = buildToolDefs(extensions);
@@ -356,6 +341,16 @@ async function main() {
   const servers: Server[] = [];
 
   if (http) {
+    const isLoopback =
+      host === "127.0.0.1" ||
+      host === "localhost" ||
+      host === "::1";
+    if (!isLoopback) {
+      console.error("raybridge: WARNING: HTTP is bound to a non-loopback interface.");
+      console.error("raybridge: WARNING: This may expose Raycast OAuth tokens to other machines/users.");
+      console.error("raybridge: WARNING: Prefer --host 127.0.0.1 and use firewall rules if needed.");
+    }
+
     // HTTP mode
     const { startHttpServer } = await import("./http-server.js");
 
@@ -393,6 +388,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Fatal:", err);
+  console.error("Fatal:", redactSecrets(String(err)));
   process.exit(1);
 });

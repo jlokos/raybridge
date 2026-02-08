@@ -1,8 +1,25 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, unlinkSync, mkdtempSync, rmdirSync } from "node:fs";
-import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
+import { getRaycastDataDir } from "./raycast-paths.js";
+import { resolveWindowsPowerShellExe } from "./windows-exe.js";
+import { normalizeBackendDump, normalizeExtensionsRows } from "./auth-normalize.js";
 
 const RAYCAST_SALT = "yvkwWXzxPPBAqY2tmaKrB*DvYjjMaeEf";
 
@@ -18,69 +35,125 @@ export interface TokenSet {
   tokenType?: string;
 }
 
-
-/**
- * Read the database encryption key from macOS Keychain, derive the
- * passphrase using Raycast's salt, and return it.
- */
-function getDatabasePassphrase(): string {
-  const keyHex = execFileSync("security", [
-    "find-generic-password",
-    "-s",
-    "Raycast",
-    "-a",
-    "database_key",
-    "-w",
-  ], { encoding: "utf-8" }).trim();
-
-  return createHash("sha256")
-    .update(keyHex + RAYCAST_SALT)
-    .digest("hex");
+export interface RaycastAuthData {
+  tokens: Map<string, TokenSet[]>;
+  prefs: Record<string, Record<string, unknown>>;
 }
 
-/**
- * Query Raycast's encrypted SQLite database using sqlcipher CLI.
- * Uses unique temp directory per query and includes retry logic for transient errors.
- */
-function queryDB(passphrase: string, sql: string, retries = 3): any[] {
-  const dbDir = join(
-    homedir(),
-    "Library",
-    "Application Support",
-    "com.raycast.macos"
-  );
-  const dbPath = join(dbDir, "raycast-enc.sqlite");
+const emptyAuthData = (): RaycastAuthData => ({ tokens: new Map(), prefs: {} });
 
-  // Create unique temp directory per query to avoid conflicts
-  const tmpDir = mkdtempSync(join(tmpdir(), "raybridge-db-"));
-  const tmpDb = join(tmpDir, "raycast-enc.sqlite");
+// ============================================================================
+// Public API
+// ============================================================================
 
-  const cleanup = () => {
-    for (const ext of ["", "-wal", "-shm"]) {
-      try {
-        unlinkSync(tmpDb + ext);
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
+export async function loadRaycastAuthData(): Promise<RaycastAuthData> {
+  if (process.platform === "win32") {
     try {
-      rmdirSync(tmpDir);
-    } catch {
-      // Ignore cleanup errors
+      const data = await loadRaycastAuthDataWindowsBackend();
+      return data ?? emptyAuthData();
+    } catch (err: any) {
+      console.error(`raybridge: Windows OAuth load failed: ${err?.message || String(err)}`);
+      return emptyAuthData();
     }
-  };
+  }
 
+  if (process.platform === "darwin") {
+    try {
+      return loadRaycastAuthDataMacSqlcipher();
+    } catch (err: any) {
+      console.error(`raybridge: Could not read Raycast auth data: ${err?.message || String(err)}`);
+      return emptyAuthData();
+    }
+  }
+
+  return emptyAuthData();
+}
+
+// ============================================================================
+// macOS: sqlcipher (minimal, single query)
+// ============================================================================
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function getMacDatabasePassphrase(): string {
+  const keyHex = execFileSync(
+    "security",
+    ["find-generic-password", "-s", "Raycast", "-a", "database_key", "-w"],
+    { encoding: "utf-8" }
+  ).trim();
+  return sha256Hex(keyHex + RAYCAST_SALT);
+}
+
+function sleepSync(ms: number) {
+  if (typeof Bun !== "undefined" && (Bun as any).sleepSync) {
+    (Bun as any).sleepSync(ms);
+    return;
+  }
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    // Busy wait fallback
+  }
+}
+
+function stripShellPreamble(out: string): string {
+  let s = out ?? "";
+  // Some shells print leading "ok" lines for PRAGMAs.
+  s = s.replace(/^(?:\s*ok\s*\r?\n)+/i, "");
+  s = s.trimStart();
+
+  // If there is any other preamble, try to locate the beginning of JSON.
+  if (s.length > 0 && s[0] !== "[" && s[0] !== "{") {
+    const idx = s.search(/[\[{]/);
+    if (idx >= 0) s = s.slice(idx);
+  }
+
+  return s.trim();
+}
+
+function loadRaycastAuthDataMacSqlcipher(): RaycastAuthData {
+  const dataDir = getRaycastDataDir();
+  const dbPath = join(dataDir, "raycast-enc.sqlite");
+  if (!existsSync(dbPath)) return emptyAuthData();
+
+  const passphrase = getMacDatabasePassphrase();
+  const sqlcipherExe = process.env.RAYBRIDGE_SQLCIPHER_PATH?.trim() || "sqlcipher";
+
+  const sql =
+    "SELECT name, tokenSets, preferences FROM extensions " +
+    "WHERE (tokenSets IS NOT NULL AND tokenSets != '') " +
+    "OR (preferences IS NOT NULL AND preferences != '');";
+
+  const retries = 3;
   for (let attempt = 1; attempt <= retries; attempt++) {
+    const tmpDir = mkdtempSync(join(tmpdir(), "raybridge-db-"));
+    const tmpDb = join(tmpDir, basename(dbPath));
+
+    const cleanup = () => {
+      for (const ext of ["", "-wal", "-shm"]) {
+        try {
+          unlinkSync(tmpDb + ext);
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        rmdirSync(tmpDir);
+      } catch {
+        /* ignore */
+      }
+    };
+
     try {
-      // Copy all DB files as close together as possible
       copyFileSync(dbPath, tmpDb);
       for (const ext of ["-wal", "-shm"]) {
         const src = dbPath + ext;
         if (existsSync(src)) copyFileSync(src, tmpDb + ext);
       }
 
-      const input = `PRAGMA key = '${passphrase}';\n.mode json\n${sql}`;
-      const result = execSync(`sqlcipher "${tmpDb}"`, {
+      const input = `PRAGMA key = '${passphrase}';\n.mode json\n${sql}\n`;
+      const proc = spawnSync(sqlcipherExe, [tmpDb], {
         input,
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
@@ -88,13 +161,17 @@ function queryDB(passphrase: string, sql: string, retries = 3): any[] {
 
       cleanup();
 
-      const jsonStr = result.startsWith("ok\n") ? result.slice(3) : result;
-      try {
-        return JSON.parse(jsonStr.trim());
-      } catch {
-        return [];
+      if (proc.error) throw proc.error;
+      if (typeof proc.status === "number" && proc.status !== 0) {
+        throw new Error(`sqlcipher exited with code ${proc.status}`);
       }
+      if (proc.signal) throw new Error(`sqlcipher exited due to signal ${proc.signal}`);
+
+      const jsonStr = stripShellPreamble(String(proc.stdout || ""));
+      const rows = JSON.parse(jsonStr.trim());
+      return normalizeExtensionsRows(rows);
     } catch (err: any) {
+      cleanup();
       const message = err?.message || String(err);
       const isTransient =
         message.includes("database is locked") ||
@@ -102,96 +179,508 @@ function queryDB(passphrase: string, sql: string, retries = 3): any[] {
         message.includes("no such table");
 
       if (isTransient && attempt < retries) {
-        // Brief delay before retry - give Raycast time to finish writing
-        const delay = 50 * attempt;
-        if (typeof Bun !== "undefined" && Bun.sleepSync) {
-          Bun.sleepSync(delay);
-        } else {
-          const start = Date.now();
-          while (Date.now() - start < delay) {
-            // Busy wait fallback
-          }
-        }
+        sleepSync(50 * attempt);
         continue;
       }
-
-      cleanup();
       throw err;
     }
   }
 
-  cleanup();
-  return [];
+  return emptyAuthData();
 }
 
-/**
- * Load OAuth token sets for all extensions from Raycast's encrypted DB.
- * Returns a map of extension name -> array of token sets.
- */
-export function loadRaycastTokens(): Map<string, TokenSet[]> {
-  const tokens = new Map<string, TokenSet[]>();
+// ============================================================================
+// Windows: Raycast backend runtime (no sqlcipher fallback)
+// ============================================================================
 
-  try {
-    const passphrase = getDatabasePassphrase();
-    const rows = queryDB(
-      passphrase,
-      "SELECT name, tokenSets FROM extensions WHERE tokenSets IS NOT NULL AND tokenSets != '';"
-    );
+function encodePowerShell(script: string): string {
+  // PowerShell expects UTF-16LE for -EncodedCommand.
+  return Buffer.from(script, "utf16le").toString("base64");
+}
 
-    for (const row of rows) {
-      if (!row.name || !row.tokenSets) continue;
-      try {
-        const parsed = JSON.parse(row.tokenSets);
-        const sets = Array.isArray(parsed) ? parsed : [parsed];
-        tokens.set(row.name, sets as TokenSet[]);
-      } catch {
-        continue;
-      }
-    }
-  } catch (err) {
-    console.error("raybridge: Could not read Raycast OAuth tokens:", err);
+function trimNulls(value: string): string {
+  return value.replace(/\0+$/g, "").trim();
+}
+
+function isPrintableAscii(value: string): boolean {
+  // Avoid feeding arbitrary binary garbage into any string contexts.
+  return /^[\x20-\x7E]+$/.test(value);
+}
+
+const WINDOWS_BACKENDDBKEY_TARGETS = [
+  "Raycast-Production/BackendDBKey",
+  "LegacyGeneric:target=Raycast-Production/BackendDBKey",
+] as const;
+
+function readWindowsCredentialBlob(target: string): Buffer | null {
+  const psExe = resolveWindowsPowerShellExe();
+  const ps = `
+$ProgressPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$target = '${target.replace(/'/g, "''")}'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class CredProbe {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FILETIME {
+    public UInt32 dwLowDateTime;
+    public UInt32 dwHighDateTime;
   }
 
-  return tokens;
-}
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct CREDENTIAL {
+    public UInt32 Flags;
+    public UInt32 Type;
+    public string TargetName;
+    public string Comment;
+    public FILETIME LastWritten;
+    public UInt32 CredentialBlobSize;
+    public IntPtr CredentialBlob;
+    public UInt32 Persist;
+    public UInt32 AttributeCount;
+    public IntPtr Attributes;
+    public string TargetAlias;
+    public string UserName;
+  }
 
-/**
- * Load extension preferences from Raycast's encrypted DB.
- * Returns a map of extension name -> preference key-value pairs.
- */
-export function loadRaycastPreferences(): Record<string, Record<string, unknown>> {
-  const prefs: Record<string, Record<string, unknown>> = {};
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+
+  [DllImport("advapi32.dll", SetLastError = true)]
+  public static extern void CredFree(IntPtr cred);
+
+  public static byte[] ReadBlob(string target) {
+    IntPtr p;
+    if (!CredRead(target, 1, 0, out p)) return null;
+    try {
+      var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+      if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize == 0) return new byte[0];
+      var b = new byte[c.CredentialBlobSize];
+      Marshal.Copy(c.CredentialBlob, b, 0, b.Length);
+      return b;
+    } finally {
+      CredFree(p);
+    }
+  }
+}
+"@
+
+$blob = [CredProbe]::ReadBlob($target)
+if ($null -eq $blob) { exit 2 }
+[Convert]::ToBase64String($blob)
+`.trim();
 
   try {
-    const passphrase = getDatabasePassphrase();
-    const rows = queryDB(
-      passphrase,
-      "SELECT name, preferences FROM extensions WHERE preferences IS NOT NULL AND preferences != '';"
-    );
+    const out = execFileSync(
+      psExe,
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(ps)],
+      { encoding: "utf-8" }
+    ).trim();
+    if (!out) return null;
+    return Buffer.from(out, "base64");
+  } catch {
+    return null;
+  }
+}
 
-    for (const row of rows) {
-      if (!row.name || !row.preferences) continue;
+let warnedWindowsBackendKeyMissing = false;
+
+function getWindowsBackendDbKeyString(): string | null {
+  for (const target of WINDOWS_BACKENDDBKEY_TARGETS) {
+    const blob = readWindowsCredentialBlob(target);
+    if (!blob || blob.length === 0) continue;
+
+    const utf8 = trimNulls(blob.toString("utf8")).trim();
+    if (utf8 && isPrintableAscii(utf8)) return utf8;
+
+    const utf16 = trimNulls(blob.toString("utf16le")).trim();
+    if (utf16 && isPrintableAscii(utf16)) return utf16;
+  }
+
+  // Fallback: last_key file (best effort).
+  try {
+    const dataDir = getRaycastDataDir();
+    const lastKeyPath = join(dataDir, "last_key");
+    if (existsSync(lastKeyPath)) {
+      const blob = readFileSync(lastKeyPath);
+      if (blob && blob.length > 0) {
+        const utf8 = trimNulls(blob.toString("utf8")).trim();
+        if (utf8 && isPrintableAscii(utf8)) return utf8;
+        const utf16 = trimNulls(blob.toString("utf16le")).trim();
+        if (utf16 && isPrintableAscii(utf16)) return utf16;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+function getRaycastAppxInstallInfo(): { installLocation: string; version: string } | null {
+  const psExe = resolveWindowsPowerShellExe();
+  const ps = `
+$ProgressPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$pkg = Get-AppxPackage -Name 'Raycast.Raycast' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $pkg) { exit 2 }
+if (-not $pkg.InstallLocation) { exit 3 }
+Write-Output ('LOC|' + $pkg.InstallLocation)
+Write-Output ('VER|' + $pkg.Version.ToString())
+`.trim();
+
+  try {
+    const out = execFileSync(
+      psExe,
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(ps)],
+      { encoding: "utf-8" }
+    );
+    let loc = "";
+    let ver = "";
+    for (const line of out.split(/\r?\n/)) {
+      if (line.startsWith("LOC|")) loc = line.slice("LOC|".length).trim();
+      if (line.startsWith("VER|")) ver = line.slice("VER|".length).trim();
+    }
+    if (!loc || !ver) return null;
+    return { installLocation: loc, version: ver };
+  } catch {
+    return null;
+  }
+}
+
+function ensureRaycastBackendCopy(): { backendDir: string; nodeExe: string } | null {
+  if (process.env.RAYBRIDGE_DISABLE_RAYCAST_BACKEND === "1") return null;
+
+  const info = getRaycastAppxInstallInfo();
+  if (!info) return null;
+
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) return null;
+
+  const cacheBase =
+    process.env.RAYBRIDGE_RAYCAST_BACKEND_CACHE_DIR?.trim() ||
+    join(localAppData, "raybridge", "raycast-backend");
+  const dest = join(cacheBase, info.version);
+  const nodeExe = join(dest, "node.exe");
+  const binding = join(dest, "data.win32-x64-msvc.node");
+
+  if (existsSync(nodeExe) && existsSync(binding)) {
+    return { backendDir: dest, nodeExe };
+  }
+
+  // Prevent concurrent copy/corruption.
+  const lockPath = join(cacheBase, `${info.version}.copy.lock`);
+  const acquireLock = (): (() => void) | null => {
+    try {
+      mkdirSync(cacheBase, { recursive: true });
+    } catch {
+      /* ignore */
+    }
+
+    const start = Date.now();
+    while (Date.now() - start < 10_000) {
       try {
-        const parsed = JSON.parse(row.preferences);
-        // Preferences are stored as array of {name, value, ...} objects
-        const prefObj: Record<string, unknown> = {};
-        if (Array.isArray(parsed)) {
-          for (const pref of parsed) {
-            if (pref.name && pref.value !== undefined) {
-              prefObj[pref.name] = pref.value;
-            }
+        const fd = openSync(lockPath, "wx");
+        try {
+          const content = JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + "\n";
+          writeFileSync(fd, content, { encoding: "utf-8" } as any);
+        } catch {
+          /* ignore */
+        } finally {
+          try {
+            closeSync(fd);
+          } catch {
+            /* ignore */
           }
         }
-        if (Object.keys(prefObj).length > 0) {
-          prefs[row.name] = prefObj;
-        }
+        return () => {
+          try {
+            unlinkSync(lockPath);
+          } catch {
+            /* ignore */
+          }
+        };
       } catch {
-        continue;
+        // Lock exists. If it looks stale, remove it; otherwise wait a bit.
+        try {
+          const st = statSync(lockPath);
+          if (Date.now() - st.mtimeMs > 60_000) {
+            try {
+              unlinkSync(lockPath);
+              continue;
+            } catch {
+              /* ignore */
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        sleepSync(100);
       }
     }
-  } catch (err) {
-    console.error("raybridge: Could not read Raycast preferences:", err);
+    return null;
+  };
+
+  const release = acquireLock();
+  if (!release) return null;
+
+  try {
+    if (existsSync(nodeExe) && existsSync(binding)) {
+      return { backendDir: dest, nodeExe };
+    }
+
+    const psExe = resolveWindowsPowerShellExe();
+    const src = join(info.installLocation, "Raycast", "backend");
+    const ps = `
+$ProgressPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$src = '${src.replace(/'/g, "''")}'
+$dest = '${dest.replace(/'/g, "''")}'
+if (-not (Test-Path $src)) { throw ('Backend dir not found: ' + $src) }
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force
+`.trim();
+
+    try {
+      execFileSync(psExe, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(ps)], {
+        encoding: "utf-8",
+        stdio: "ignore",
+      });
+    } catch {
+      return null;
+    }
+
+    if (existsSync(nodeExe) && existsSync(binding)) {
+      return { backendDir: dest, nodeExe };
+    }
+    return null;
+  } finally {
+    release();
+  }
+}
+
+let cachedWindowsAuth: { atMs: number; data: RaycastAuthData } | null = null;
+
+async function loadRaycastAuthDataWindowsBackend(): Promise<RaycastAuthData | null> {
+  if (process.platform !== "win32") return null;
+
+  const now = Date.now();
+  if (cachedWindowsAuth && now - cachedWindowsAuth.atMs < 2000) {
+    return cachedWindowsAuth.data;
   }
 
-  return prefs;
+  const key = getWindowsBackendDbKeyString();
+  if (!key) {
+    if (!warnedWindowsBackendKeyMissing) {
+      warnedWindowsBackendKeyMissing = true;
+      console.error(
+        "raybridge: Windows BackendDBKey not found. Open Raycast once and sign in; then re-run."
+      );
+    }
+    return null;
+  }
+
+  const backend = ensureRaycastBackendCopy();
+  if (!backend) return null;
+
+  const dataDir = getRaycastDataDir();
+
+  const script = `
+const fs = require("node:fs");
+const path = require("node:path");
+
+const DEBUG = process.env.RAYBRIDGE_DEBUG_WINDOWS_BACKEND === "1";
+function dbg(msg) {
+  if (!DEBUG) return;
+  try { process.stderr.write("[raybridge-backend] " + String(msg) + "\\n"); } catch {}
+}
+
+function fail(msg) {
+  process.stderr.write(String(msg || "unknown error") + "\\n");
+  process.exit(1);
+}
+
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function listDbFiles(dir) {
+  try {
+    const entries = fs.readdirSync(dir);
+    return entries
+      .filter((n) => /\\.(db|sqlite|sqlite3)$/i.test(n))
+      .map((n) => path.join(dir, n));
+  } catch {
+    return [];
+  }
+}
+
+function tryOpenWithBinding(dbPath, backendKey) {
+  const bindingPath = path.join(process.cwd(), "data.win32-x64-msvc.node");
+  if (!fs.existsSync(bindingPath)) return null;
+
+  let binding;
+  try { binding = require(bindingPath); } catch { return null; }
+  dbg("binding keys=" + Object.keys(binding || {}).join(","));
+
+  const Database =
+    (binding && (binding.Database || binding.default)) ||
+    (typeof binding === "function" ? binding : null);
+  if (typeof Database !== "function") {
+    dbg("binding Database export not found");
+    return null;
+  }
+
+  let db;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  } catch {
+    try { db = new Database(dbPath); } catch { dbg("open failed"); return null; }
+  }
+
+  try {
+    const escaped = String(backendKey).replace(/'/g, "''");
+    const pragmaArg = "key='" + escaped + "'";
+    if (db && typeof db.pragma === "function") db.pragma(pragmaArg);
+    if (db && typeof db.exec === "function") db.exec("PRAGMA " + pragmaArg + ";");
+    if (db && typeof db.run === "function") db.run("PRAGMA " + pragmaArg + ";");
+    if (db && typeof db.key === "function") db.key(String(backendKey));
+  } catch {
+    // ignore
+  }
+
+  return db;
+}
+
+function hasExtensionsTable(db) {
+  try {
+    if (!db) return false;
+    if (typeof db.prepare !== "function") { dbg("db.prepare missing"); return false; }
+    const stmt = db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='table' AND name='extensions'");
+    let row = null;
+    if (stmt && typeof stmt.get === "function") row = stmt.get();
+    else if (stmt && typeof stmt.all === "function") row = (stmt.all() || [])[0];
+    return !!row && Number(row.c) > 0;
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+function queryExtensions(db) {
+  if (typeof db.prepare !== "function") return [];
+  try {
+    return db.prepare(
+      "SELECT name, tokenSets, preferences FROM extensions WHERE (tokenSets IS NOT NULL AND tokenSets != '') OR (preferences IS NOT NULL AND preferences != '')"
+    ).all();
+  } catch {
+    return [];
+  }
+}
+
+function parsePreferences(prefJson) {
+  const parsed = safeJsonParse(prefJson);
+  if (!Array.isArray(parsed)) return null;
+  const out = {};
+  for (const p of parsed) {
+    if (!p || typeof p !== "object") continue;
+    if (typeof p.name !== "string") continue;
+    if (!Object.prototype.hasOwnProperty.call(p, "value")) continue;
+    out[p.name] = p.value;
+  }
+  return out;
+}
+
+function parseTokenSets(tokenJson) {
+  const parsed = safeJsonParse(tokenJson);
+  if (!parsed) return null;
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function main() {
+  const raycastDir = process.env.RAYCAST_DIR;
+  const backendKey = process.env.RAYCAST_BACKEND_DB_KEY;
+  if (!raycastDir) fail("RAYCAST_DIR is required");
+  if (!backendKey) fail("RAYCAST_BACKEND_DB_KEY is required");
+
+  dbg("raycastDir=" + raycastDir);
+  const dbFiles = listDbFiles(raycastDir);
+  dbg("dbFiles=" + dbFiles.map((p) => path.basename(p)).join(","));
+  if (dbFiles.length === 0) fail("no DB files found under " + raycastDir);
+
+  let db = null;
+  for (const dbPath of dbFiles) {
+    dbg("trying db=" + path.basename(dbPath));
+    const candidate = tryOpenWithBinding(dbPath, backendKey);
+    if (!candidate) continue;
+    const ok = hasExtensionsTable(candidate);
+    dbg("hasExtensionsTable=" + ok);
+    if (ok) { db = candidate; break; }
+    try { if (candidate && typeof candidate.close === "function") candidate.close(); } catch {}
+  }
+
+  if (!db) fail("could not open any Raycast DB with extensions table");
+
+  const rows = queryExtensions(db);
+  const tokens = {};
+  const prefs = {};
+
+  for (const row of rows || []) {
+    const name = row && row.name;
+    if (typeof name !== "string" || !name) continue;
+
+    if (typeof row.tokenSets === "string" && row.tokenSets.trim()) {
+      const sets = parseTokenSets(row.tokenSets);
+      if (sets && Array.isArray(sets) && sets.length > 0) tokens[name] = sets;
+    }
+    if (typeof row.preferences === "string" && row.preferences.trim()) {
+      const p = parsePreferences(row.preferences);
+      if (p && Object.keys(p).length > 0) prefs[name] = p;
+    }
+  }
+
+  process.stdout.write(JSON.stringify({ tokens, prefs }));
+}
+
+main();
+`.trim();
+
+  const res = spawnSync(backend.nodeExe, ["-e", script], {
+    cwd: backend.backendDir,
+    env: {
+      ...process.env,
+      RAYCAST_DIR: dataDir,
+      RAYCAST_BACKEND_DB_KEY: key,
+    },
+    encoding: "utf-8",
+    maxBuffer: 50 * 1024 * 1024,
+  });
+
+  if (res.error) throw res.error;
+  if (res.status !== 0) {
+    const err = (res.stderr || res.stdout || "").trim();
+    throw new Error(err || `raycast backend dump failed (exit ${res.status})`);
+  }
+
+  const stdout = (res.stdout || "").trim();
+  if (!stdout) return null;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error("raycast backend dump returned non-JSON output");
+  }
+
+  const data = normalizeBackendDump(parsed);
+  cachedWindowsAuth = { atMs: now, data };
+  return data;
 }
