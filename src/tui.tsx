@@ -8,8 +8,10 @@ import { discoverExtensions, type ExtensionEntry, type ToolEntry } from "./disco
 import {
   loadToolsConfig,
   saveToolsConfig,
+  normalizeLegacyConfig,
   type ToolsConfig,
 } from "./config.js";
+import { getSpinnerFrames, isInteractive, MIN_LOADING_MS } from "./spinner.js";
 
 // UI colors with visual hierarchy
 const COLORS = {
@@ -74,6 +76,7 @@ interface AppState {
   scrollOffset: number;
   expanded: Set<string>;
   loading: boolean;
+  saving: boolean;
   saved: boolean;
   error: string | null;
 }
@@ -85,17 +88,25 @@ interface AppProps {
 function App({ onExit }: AppProps) {
   const [state, setState] = useState<AppState>({
     extensions: [],
-    config: { mode: "blocklist", extensions: {} },
+    config: { extensions: {} },
     cursor: 0,
     scrollOffset: 0,
     expanded: new Set(),
     loading: true,
+    saving: false,
     saved: false,
     error: null,
   });
 
   // Track terminal dimensions for responsive layout
   const [terminalSize, setTerminalSize] = useState(getTerminalSize);
+
+  // Animated loading spinner (braille frames when TTY, else static fallback)
+  const [spinnerFrame, setSpinnerFrame] = useState(0);
+  const spinnerFrames = getSpinnerFrames("braille");
+  const loadingIndicator = isInteractive(process.stdout)
+    ? spinnerFrames.frames[spinnerFrame % spinnerFrames.frames.length]
+    : "◈";
 
   useEffect(() => {
     const handleResize = () => setTerminalSize(getTerminalSize());
@@ -104,6 +115,15 @@ function App({ onExit }: AppProps) {
       process.stdout.off("resize", handleResize);
     };
   }, []);
+
+  useEffect(() => {
+    if ((!state.loading && !state.saving) || !isInteractive(process.stdout)) return;
+    const timer = setInterval(
+      () => setSpinnerFrame((f) => (f + 1) % spinnerFrames.frames.length),
+      spinnerFrames.interval
+    );
+    return () => clearInterval(timer);
+  }, [state.loading, state.saving, spinnerFrames.frames.length, spinnerFrames.interval]);
 
   // Calculate visible rows (terminal height minus header and footer)
   const visibleRows = useMemo(() => {
@@ -143,23 +163,34 @@ function App({ onExit }: AppProps) {
 
   useEffect(() => {
     async function load() {
+      const start = Date.now();
       try {
-        const [extensions, config] = await Promise.all([
+        const [extensions, rawConfig] = await Promise.all([
           discoverExtensions(),
           loadToolsConfig(),
         ]);
+        const { config, didMigrate } = normalizeLegacyConfig(rawConfig, extensions);
+        if (didMigrate) {
+          await saveToolsConfig(config);
+        }
 
-        // First extension is at index 0 now (no section header)
-        const initialCursor = 0;
+        const elapsed = Date.now() - start;
+        if (elapsed < MIN_LOADING_MS) {
+          await new Promise((r) => setTimeout(r, MIN_LOADING_MS - elapsed));
+        }
 
         setState((s) => ({
           ...s,
           extensions,
           config,
-          cursor: initialCursor,
+          cursor: 0,
           loading: false,
         }));
       } catch (err: unknown) {
+        const elapsed = Date.now() - start;
+        if (elapsed < MIN_LOADING_MS) {
+          await new Promise((r) => setTimeout(r, MIN_LOADING_MS - elapsed));
+        }
         const message = err instanceof Error ? err.message : String(err);
         setState((s) => ({
           ...s,
@@ -174,11 +205,7 @@ function App({ onExit }: AppProps) {
   const isExtensionEnabled = useCallback(
     (ext: ExtensionEntry): boolean => {
       const extConfig = state.config.extensions[ext.extensionName];
-      if (state.config.mode === "blocklist") {
-        return extConfig?.enabled !== false;
-      } else {
-        return extConfig?.enabled === true;
-      }
+      return extConfig?.enabled !== false;
     },
     [state.config]
   );
@@ -187,8 +214,8 @@ function App({ onExit }: AppProps) {
     (ext: ExtensionEntry, toolName: string): boolean => {
       const extConfig = state.config.extensions[ext.extensionName];
       if (!isExtensionEnabled(ext)) return false;
-      if (!extConfig?.tools || extConfig.tools.length === 0) return true;
-      return extConfig.tools.includes(toolName);
+      if (!extConfig?.disabledTools || extConfig.disabledTools.length === 0) return true;
+      return !extConfig.disabledTools.includes(toolName);
     },
     [state.config, isExtensionEnabled]
   );
@@ -197,8 +224,8 @@ function App({ onExit }: AppProps) {
     (ext: ExtensionEntry): number => {
       if (!isExtensionEnabled(ext)) return 0;
       const extConfig = state.config.extensions[ext.extensionName];
-      if (!extConfig?.tools || extConfig.tools.length === 0) return ext.tools.length;
-      return extConfig.tools.filter((t) => ext.tools.some((et) => et.name === t)).length;
+      if (!extConfig?.disabledTools || extConfig.disabledTools.length === 0) return ext.tools.length;
+      return ext.tools.filter((t) => !extConfig.disabledTools!.includes(t.name)).length;
     },
     [state.config, isExtensionEnabled]
   );
@@ -208,19 +235,13 @@ function App({ onExit }: AppProps) {
       const ext = s.extensions.find((e) => e.extensionName === extName);
       if (!ext) return s;
 
-      const currentEnabled =
-        s.config.mode === "blocklist"
-          ? s.config.extensions[extName]?.enabled !== false
-          : s.config.extensions[extName]?.enabled === true;
-
+      const currentEnabled = s.config.extensions[extName]?.enabled !== false;
       const newExtensions = { ...s.config.extensions };
-      newExtensions[extName] = {
-        ...newExtensions[extName],
-        enabled: !currentEnabled,
-      };
 
-      if (!currentEnabled) {
-        delete newExtensions[extName].tools;
+      if (currentEnabled) {
+        newExtensions[extName] = { enabled: false };
+      } else {
+        delete newExtensions[extName];
       }
 
       return {
@@ -236,35 +257,27 @@ function App({ onExit }: AppProps) {
       const ext = s.extensions.find((e) => e.extensionName === extName);
       if (!ext) return s;
 
-      const extConfig = s.config.extensions[extName] || { enabled: true };
-      // If extension is disabled, treat as no tools selected
-      // If tools list exists, use it; otherwise all tools are selected
-      const extEnabled = s.config.mode === "blocklist"
-        ? extConfig.enabled !== false
-        : extConfig.enabled === true;
-      const currentTools = !extEnabled
-        ? new Set<string>()
-        : extConfig.tools && extConfig.tools.length > 0
-          ? new Set(extConfig.tools)
-          : new Set(ext.tools.map((t) => t.name));
+      const extConfig = s.config.extensions[extName];
+      const extEnabled = extConfig?.enabled !== false;
+      if (!extEnabled) return s;
 
-      if (currentTools.has(toolName)) {
-        currentTools.delete(toolName);
+      const disabledSet = new Set(extConfig?.disabledTools ?? []);
+      if (disabledSet.has(toolName)) {
+        disabledSet.delete(toolName);
       } else {
-        currentTools.add(toolName);
+        disabledSet.add(toolName);
       }
 
       const newExtensions = { ...s.config.extensions };
 
-      if (currentTools.size === ext.tools.length) {
-        newExtensions[extName] = { ...extConfig, enabled: true, tools: undefined };
-      } else if (currentTools.size === 0) {
-        newExtensions[extName] = { enabled: false, tools: undefined };
+      if (disabledSet.size === ext.tools.length) {
+        newExtensions[extName] = { enabled: false };
+      } else if (disabledSet.size === 0) {
+        delete newExtensions[extName];
       } else {
         newExtensions[extName] = {
-          ...extConfig,
           enabled: true,
-          tools: Array.from(currentTools),
+          disabledTools: Array.from(disabledSet),
         };
       }
 
@@ -289,12 +302,23 @@ function App({ onExit }: AppProps) {
   }, []);
 
   const save = useCallback(async () => {
+    if (state.saving) return;
+    setState((s) => ({ ...s, saving: true }));
+    const start = Date.now();
     try {
       await saveToolsConfig(state.config);
-      setState((s) => ({ ...s, saved: true }));
+      const elapsed = Date.now() - start;
+      if (elapsed < MIN_LOADING_MS) {
+        await new Promise((r) => setTimeout(r, MIN_LOADING_MS - elapsed));
+      }
+      setState((s) => ({ ...s, saving: false, saved: true }));
     } catch (err: unknown) {
+      const elapsed = Date.now() - start;
+      if (elapsed < MIN_LOADING_MS) {
+        await new Promise((r) => setTimeout(r, MIN_LOADING_MS - elapsed));
+      }
       const message = err instanceof Error ? err.message : String(err);
-      setState((s) => ({ ...s, error: `Save failed: ${message}` }));
+      setState((s) => ({ ...s, saving: false, error: `Save failed: ${message}` }));
     }
   }, [state.config]);
 
@@ -329,7 +353,7 @@ function App({ onExit }: AppProps) {
   }, [visibleRows, navItems]);
 
   useKeyboard((key) => {
-    if (state.loading) return;
+    if (state.loading || state.saving) return;
 
     if (key.name === "q") {
       onExit();
@@ -406,7 +430,7 @@ function App({ onExit }: AppProps) {
       <box flexDirection="column">
         <text fg={COLORS.accent}>{displayLogo}</text>
         <text> </text>
-        <text fg={COLORS.muted}>◈ Loading extensions...</text>
+        <text fg={COLORS.muted}>{loadingIndicator} Loading extensions...</text>
       </box>
     );
   }
@@ -526,14 +550,15 @@ function App({ onExit }: AppProps) {
         <text fg={COLORS.dim}>q</text>
         <text fg={COLORS.muted}>quit</text>
       </box>
-      {state.saved && <text fg={COLORS.success}>✓ Configuration saved</text>}
+      {state.saving && <text fg={COLORS.muted}>{loadingIndicator} Saving...</text>}
+      {state.saved && !state.saving && <text fg={COLORS.success}>✓ Configuration saved</text>}
     </box>
   );
 }
 
 let renderer: CliRenderer | null = null;
 
-export async function launchTUI(): Promise<void> {
+export async function launchTUI(options?: { onReady?: () => void }): Promise<void> {
   renderer = await createCliRenderer({
     exitOnCtrlC: true,
     useAlternateScreen: true,
@@ -550,6 +575,7 @@ export async function launchTUI(): Promise<void> {
     };
 
     root.render(<App onExit={handleExit} />);
+    options?.onReady?.();
     renderer!.start();
   });
 }

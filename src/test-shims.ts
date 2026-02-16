@@ -15,7 +15,7 @@
 import { discoverExtensions, type ToolEntry, type ExtensionEntry } from "./discovery.js";
 import { executeTool } from "./loader.js";
 import { setPreferences, setRaycastTokens, installShims } from "./shims.js";
-import { loadRaycastTokens } from "./auth.js";
+import { loadRaycastAuthData } from "./auth.js";
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -255,14 +255,22 @@ async function main() {
   console.log("└─────────────────────────────────────────────────────────────┘\n");
 
   // Initialize
-  const prefs = await loadPreferences();
-  setPreferences(prefs);
-
   try {
-    const tokens = loadRaycastTokens();
-    setRaycastTokens(tokens);
+    const manualPrefs = await loadPreferences();
+    const auth = await loadRaycastAuthData();
+
+    const mergedPrefs: Record<string, Record<string, unknown>> = { ...manualPrefs };
+    for (const [extName, extPrefs] of Object.entries(auth.prefs || {})) {
+      mergedPrefs[extName] = { ...extPrefs, ...(manualPrefs[extName] || {}) };
+    }
+
+    setPreferences(mergedPrefs);
+    setRaycastTokens(auth.tokens || new Map());
   } catch {
     console.log("⚠️  Could not load OAuth tokens\n");
+    const prefs = await loadPreferences();
+    setPreferences(prefs);
+    setRaycastTokens(new Map());
   }
 
   installShims();

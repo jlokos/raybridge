@@ -13,6 +13,7 @@
     "dev": "bun --watch src/index.ts",
     "dev:http": "MCP_HTTP=true bun --watch src/index.ts",
     "config": "bun run src/cli.ts",
+    "debug:auth": "bun run src/debug-auth.ts",
     "test:shims": "bun run src/test-shims.ts",
     "start:bg": "nohup bun run start:http > raybridge.log 2>&1 & echo $! > raybridge.pid && tail -f raybridge.log"
   },
@@ -22,7 +23,8 @@
     "@opentui/react": "^0.1.74",
     "@raycast/api": "^1.104.3",
     "express": "^5.0.1",
-    "react": "^19.0.0"
+    "react": "^19.0.0",
+    "unicode-animations": "^1.0.3"
   },
   "devDependencies": {
     "@types/bun": "latest",
