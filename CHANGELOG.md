@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.0
+
+### Changed
+
+- **Blocklist-only config**: Removed allowlist mode. Config now stores only what is disabled (`enabled: false` for extensions, `disabledTools` for tools). Migrates legacy configs automatically on load.
+
 ## v1.0.0
 
 Initial release.
@@ -9,4 +15,4 @@ Initial release.
 - Interactive TUI for extension configuration
 - OAuth token integration from Raycast's encrypted database
 - Raycast API shims for headless tool execution
-- Blocklist/allowlist mode for tool management
+- Blocklist-only config for tool management

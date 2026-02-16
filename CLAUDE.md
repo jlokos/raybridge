@@ -33,7 +33,7 @@ RayBridge - MCP server that bridges Raycast extensions to Claude Code.
 - `src/index.ts` - MCP server entry point
 - `src/cli.ts` - CLI entry point (config, list, help commands)
 - `src/tui.tsx` - Interactive TUI for extension configuration
-- `src/config.ts` - Tools configuration (blocklist/allowlist)
+- `src/config.ts` - Tools configuration (blocklist-only)
 
 ## Preferences
 

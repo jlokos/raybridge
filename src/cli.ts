@@ -2,7 +2,14 @@
 
 
 import { discoverExtensions, type ExtensionEntry } from "./discovery.js";
-import { loadToolsConfig, filterExtensions, getConfigPath, type ToolsConfig } from "./config.js";
+import {
+  loadToolsConfig,
+  saveToolsConfig,
+  filterExtensions,
+  getConfigPath,
+  normalizeLegacyConfig,
+  type ToolsConfig,
+} from "./config.js";
 
 const LOGO = `
 ██████╗  █████╗ ██╗   ██╗██████╗ ██████╗ ██╗██████╗  ██████╗ ███████╗
@@ -15,18 +22,14 @@ const LOGO = `
 
 function isExtensionEnabled(ext: ExtensionEntry, config: ToolsConfig): boolean {
   const extConfig = config.extensions[ext.extensionName];
-  if (config.mode === "blocklist") {
-    return extConfig?.enabled !== false;
-  } else {
-    return extConfig?.enabled === true;
-  }
+  return extConfig?.enabled !== false;
 }
 
 function getEnabledToolCount(ext: ExtensionEntry, config: ToolsConfig): number {
   if (!isExtensionEnabled(ext, config)) return 0;
   const extConfig = config.extensions[ext.extensionName];
-  if (!extConfig?.tools || extConfig.tools.length === 0) return ext.tools.length;
-  return extConfig.tools.filter((t) => ext.tools.some((et) => et.name === t)).length;
+  if (!extConfig?.disabledTools || extConfig.disabledTools.length === 0) return ext.tools.length;
+  return ext.tools.filter((t) => !extConfig.disabledTools!.includes(t.name)).length;
 }
 
 function printSection(
@@ -54,10 +57,10 @@ function printSection(
 
     console.log(`  ${status} ${ext.extensionTitle} - ${totalToolCount} tool${totalToolCount !== 1 ? "s" : ""}${toolStats}`);
 
-    // Show individual tools if there's a tool filter
-    if (extConfig?.tools && extConfig.tools.length > 0 && extConfig.tools.length < ext.tools.length) {
+    // Show individual tools if there are disabled tools
+    if (extConfig?.disabledTools && extConfig.disabledTools.length > 0) {
       for (const tool of ext.tools) {
-        const toolEnabled = extConfig.tools.includes(tool.name);
+        const toolEnabled = !extConfig.disabledTools.includes(tool.name);
         const toolStatus = toolEnabled ? "[x]" : "[ ]";
         console.log(`      ${toolStatus} ${tool.name}`);
       }
@@ -66,10 +69,16 @@ function printSection(
 }
 
 async function listExtensions(): Promise<void> {
-  const [extensions, config] = await Promise.all([
+  const [extensions, rawConfig] = await Promise.all([
     discoverExtensions(),
     loadToolsConfig(),
   ]);
+
+  const { config, didMigrate } = normalizeLegacyConfig(rawConfig, extensions);
+  if (didMigrate) {
+    await saveToolsConfig(config);
+    console.error("raybridge: Migrated config to blocklist-only format");
+  }
 
   const filteredExtensions = filterExtensions(extensions, config);
 
@@ -82,7 +91,6 @@ async function listExtensions(): Promise<void> {
   console.log(LOGO);
   console.log("");
   console.log(`Config: ${getConfigPath()}`);
-  console.log(`Mode: ${config.mode}`);
   console.log(`Total: ${enabledExts}/${totalExts} extensions, ${enabledTools}/${totalTools} tools`);
 
   printSection("Extensions", extensions, config);
