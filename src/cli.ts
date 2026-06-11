@@ -107,14 +107,50 @@ Examples:
 `);
 }
 
+/**
+ * The interactive config TUI depends on optional packages (@opentui/*, react).
+ * When they are not installed, dynamic-importing ./tui.js throws a
+ * module-resolution error; detect that so we can show install guidance instead
+ * of a raw stack trace.
+ */
+function isMissingTuiDependency(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: string }).code;
+  const message = (err as { message?: string }).message ?? "";
+  const moduleNotFound =
+    code === "ERR_MODULE_NOT_FOUND" ||
+    code === "MODULE_NOT_FOUND" ||
+    /cannot find (module|package)/i.test(message);
+  return moduleNotFound && /@opentui|\breact\b/i.test(message);
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2];
 
   switch (command) {
     case undefined:
     case "config": {
-      const { launchTUI } = await import("./tui.js");
-      await launchTUI();
+      try {
+        const { launchTUI } = await import("./tui.js");
+        await launchTUI();
+      } catch (err) {
+        if (isMissingTuiDependency(err)) {
+          console.error(
+            [
+              "The interactive config UI requires optional dependencies that are not installed:",
+              "  @opentui/core, @opentui/react, react",
+              "",
+              "Install them with your package manager, for example:",
+              "  bun add @opentui/core @opentui/react react",
+              "",
+              "Or edit ~/.config/raybridge/tools.json directly (see docs/CONFIGURATION.md),",
+              "and run `raybridge list` to see what is currently exposed.",
+            ].join("\n")
+          );
+          process.exit(1);
+        }
+        throw err;
+      }
       break;
     }
     case "list":

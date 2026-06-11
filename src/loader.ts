@@ -3,16 +3,19 @@ import { installShims, setCurrentExtension } from "./shims.js";
 
 const require = createRequire(import.meta.url);
 
-export async function executeTool(
+export function loadToolFunction(
   jsPath: string,
-  input: Record<string, unknown>,
   extensionName: string,
   extensionDir: string
-): Promise<string> {
+): (input: Record<string, unknown>) => Promise<unknown> | unknown {
   installShims();
   setCurrentExtension(extensionName, extensionDir);
 
-  delete require.cache[jsPath];
+  try {
+    delete require.cache[require.resolve(jsPath)];
+  } catch {
+    delete require.cache[jsPath];
+  }
 
   let mod: any;
   try {
@@ -26,6 +29,16 @@ export async function executeTool(
     throw new Error(`Tool at ${jsPath} does not export a function`);
   }
 
+  return fn;
+}
+
+export async function executeTool(
+  jsPath: string,
+  input: Record<string, unknown>,
+  extensionName: string,
+  extensionDir: string
+): Promise<string> {
+  const fn = loadToolFunction(jsPath, extensionName, extensionDir);
   const result = await fn(input);
 
   if (typeof result === "string") return result;

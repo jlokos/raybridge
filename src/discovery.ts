@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import type { RaycastEval } from "./evals.js";
 
 export interface ToolEntry {
   name: string;
@@ -18,6 +19,7 @@ export interface ExtensionEntry {
   extensionId: string;
   extensionDir: string;
   aiInstructions?: string;
+  aiEvals?: RaycastEval[];
   tools: ToolEntry[];
 }
 
@@ -63,6 +65,7 @@ export async function discoverExtensions(): Promise<ExtensionEntry[]> {
       extensionId: dirName,
       extensionDir: extDir,
       aiInstructions: pkg.ai?.instructions,
+      aiEvals: Array.isArray(pkg.ai?.evals) ? pkg.ai.evals : undefined,
       tools: toolEntries,
     });
   }

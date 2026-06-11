@@ -1,12 +1,63 @@
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { EventEmitter } from "node:events";
 import type { TokenSet } from "./auth.js";
+import type { RaycastApiConfig } from "./config.js";
 
 const require = createRequire(import.meta.url);
 
 let installed = false;
 let preferences: Record<string, Record<string, unknown>> = {};
+
+const DEFAULT_SHIM_CONFIG: Required<RaycastApiConfig> = {
+  enableLocalStorage: true,
+  enableClipboard: false,
+  enableSystemActions: false,
+  enableDestructiveSystemActions: false,
+  enableAppleScript: false,
+  enableCommandLaunch: false,
+};
+
+let shimConfig: Required<RaycastApiConfig> = { ...DEFAULT_SHIM_CONFIG };
+
+function envFlag(name: string): boolean | undefined {
+  const value = process.env[name];
+  if (value === undefined) return undefined;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
+export function setShimConfig(config: RaycastApiConfig = {}) {
+  shimConfig = {
+    ...DEFAULT_SHIM_CONFIG,
+    enableLocalStorage:
+      envFlag("RAYBRIDGE_ENABLE_LOCAL_STORAGE") ??
+      config.enableLocalStorage ??
+      DEFAULT_SHIM_CONFIG.enableLocalStorage,
+    enableClipboard:
+      envFlag("RAYBRIDGE_ENABLE_CLIPBOARD") ??
+      config.enableClipboard ??
+      DEFAULT_SHIM_CONFIG.enableClipboard,
+    enableSystemActions:
+      envFlag("RAYBRIDGE_ENABLE_SYSTEM_ACTIONS") ??
+      config.enableSystemActions ??
+      DEFAULT_SHIM_CONFIG.enableSystemActions,
+    enableDestructiveSystemActions:
+      envFlag("RAYBRIDGE_ENABLE_DESTRUCTIVE_SYSTEM_ACTIONS") ??
+      config.enableDestructiveSystemActions ??
+      DEFAULT_SHIM_CONFIG.enableDestructiveSystemActions,
+    enableAppleScript:
+      envFlag("RAYBRIDGE_ENABLE_APPLESCRIPT") ??
+      config.enableAppleScript ??
+      DEFAULT_SHIM_CONFIG.enableAppleScript,
+    enableCommandLaunch:
+      envFlag("RAYBRIDGE_ENABLE_COMMAND_LAUNCH") ??
+      config.enableCommandLaunch ??
+      DEFAULT_SHIM_CONFIG.enableCommandLaunch,
+  };
+}
 
 /** Raycast DB OAuth tokens keyed by extension name. */
 let raycastTokens = new Map<string, TokenSet[]>();
@@ -116,9 +167,77 @@ function createEnumProxy(_name: string): unknown {
   });
 }
 
+function createStringEnumProxy(): Record<string, string> {
+  return new Proxy({}, {
+    get(_, prop) {
+      if (typeof prop === "symbol") return undefined;
+      return prop;
+    },
+  }) as Record<string, string>;
+}
+
 // ============================================================================
 // Explicit implementations for critical APIs
 // ============================================================================
+
+function safeStorageName(name: string): string {
+  return (name || "mcp-bridge").replace(/[^a-zA-Z0-9_.-]/g, "_");
+}
+
+async function runCommand(
+  command: string,
+  args: string[] = [],
+  input?: string
+): Promise<{ stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+
+    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const out = Buffer.concat(stdout).toString("utf-8");
+      const err = Buffer.concat(stderr).toString("utf-8");
+      if (code === 0) {
+        resolve({ stdout: out, stderr: err });
+      } else {
+        reject(new Error(`${command} exited with code ${code}: ${err || out}`));
+      }
+    });
+
+    if (input !== undefined) {
+      child.stdin.write(input);
+    }
+    child.stdin.end();
+  });
+}
+
+function assertShimEnabled(flag: keyof RaycastApiConfig, apiName: string) {
+  if (!shimConfig[flag]) {
+    throw new Error(
+      `Raycast API ${apiName} is disabled in RayBridge. Enable raycastApi.${flag} in ~/.config/raybridge/tools.json to allow it.`
+    );
+  }
+}
+
+function escapeAppleScriptString(value: string): string {
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("AppleScript path arguments cannot contain control characters");
+  }
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+async function readClipboardText(): Promise<string> {
+  assertShimEnabled("enableClipboard", "Clipboard.readText");
+  return (await runCommand("pbpaste")).stdout;
+}
+
+async function writeClipboardText(value: string): Promise<void> {
+  assertShimEnabled("enableClipboard", "Clipboard.copy");
+  await runCommand("pbcopy", [], value);
+}
 
 /** environment - runtime values for the current extension context */
 const environmentDescriptor = {
@@ -226,13 +345,52 @@ class PKCEClient {
   }
 }
 
-/** LocalStorage - async stubs */
+function localStoragePath(): string {
+  return join(
+    homedir(),
+    ".config",
+    "raybridge",
+    "local-storage",
+    `${safeStorageName(currentExtension)}.json`
+  );
+}
+
+async function readLocalStorage(): Promise<Record<string, unknown>> {
+  assertShimEnabled("enableLocalStorage", "LocalStorage");
+  try {
+    return JSON.parse(await readFile(localStoragePath(), "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+async function writeLocalStorage(values: Record<string, unknown>) {
+  assertShimEnabled("enableLocalStorage", "LocalStorage");
+  const path = localStoragePath();
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tempPath, JSON.stringify(values, null, 2) + "\n", { mode: 0o600 });
+  await rename(tempPath, path);
+}
+
+/** LocalStorage - persisted per Raycast extension */
 const LocalStorage = {
-  getItem: async (_key: string) => undefined,
-  setItem: async (_key: string, _value: string) => {},
-  removeItem: async (_key: string) => {},
-  allItems: async () => ({}),
-  clear: async () => {},
+  getItem: async (key: string) => {
+    const values = await readLocalStorage();
+    return values[key];
+  },
+  setItem: async (key: string, value: unknown) => {
+    const values = await readLocalStorage();
+    values[key] = value;
+    await writeLocalStorage(values);
+  },
+  removeItem: async (key: string) => {
+    const values = await readLocalStorage();
+    delete values[key];
+    await writeLocalStorage(values);
+  },
+  allItems: async () => readLocalStorage(),
+  clear: async () => writeLocalStorage({}),
 };
 
 /** getPreferenceValues - reads from preferences map */
@@ -264,19 +422,185 @@ async function getApplications() {
   return apps;
 }
 
-/** Clipboard - clipboard operations */
+function clipboardInputToText(input: unknown): string {
+  if (typeof input === "string") return input;
+  if (input && typeof input === "object" && "text" in input) {
+    const text = (input as { text?: unknown }).text;
+    return typeof text === "string" ? text : String(text ?? "");
+  }
+  return String(input ?? "");
+}
+
+async function pasteClipboard() {
+  assertShimEnabled("enableAppleScript", "Clipboard.paste");
+  await runAppleScript('tell application "System Events" to keystroke "v" using command down');
+}
+
+/** Clipboard - macOS clipboard operations gated by config */
 const Clipboard = {
-  copy: async (_text: string) => {},
-  paste: async () => {},
-  readText: async () => "",
-  read: async () => ({ text: "" }),
-  clear: async () => {},
+  copy: async (text: unknown) => writeClipboardText(clipboardInputToText(text)),
+  paste: async () => pasteClipboard(),
+  readText: async () => readClipboardText(),
+  read: async () => ({ text: await readClipboardText() }),
+  clear: async () => writeClipboardText(""),
 };
 
-/** AI - AI operations stub */
+async function open(target: unknown) {
+  assertShimEnabled("enableSystemActions", "open");
+  const value = target instanceof URL ? target.toString() : String(target ?? "");
+  if (!value) throw new Error("Raycast API open requires a target path or URL");
+  await runCommand("open", ["--", value]);
+}
+
+async function showInFinder(path: unknown) {
+  assertShimEnabled("enableSystemActions", "showInFinder");
+  const value = String(path ?? "");
+  if (!value) throw new Error("Raycast API showInFinder requires a path");
+  await runCommand("open", ["-R", "--", value]);
+}
+
+async function trash(pathOrPaths: unknown) {
+  assertShimEnabled("enableDestructiveSystemActions", "trash");
+  const paths = Array.isArray(pathOrPaths) ? pathOrPaths : [pathOrPaths];
+  for (const rawPath of paths) {
+    const value = String(rawPath ?? "");
+    if (!value) continue;
+    await runCommand("osascript", [
+      "-e",
+      `tell application "Finder" to delete POSIX file "${escapeAppleScriptString(value)}"`,
+    ]);
+  }
+}
+
+async function runAppleScript(script: string): Promise<string> {
+  assertShimEnabled("enableAppleScript", "runAppleScript");
+  return (await runCommand("osascript", ["-e", script])).stdout.trim();
+}
+
+async function getSelectedText(): Promise<string> {
+  assertShimEnabled("enableAppleScript", "getSelectedText");
+  assertShimEnabled("enableClipboard", "getSelectedText");
+  const previousClipboard = shimConfig.enableClipboard
+    ? await readClipboardText().catch(() => undefined)
+    : undefined;
+
+  await runAppleScript('tell application "System Events" to keystroke "c" using command down');
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const selected = await readClipboardText();
+
+  if (previousClipboard !== undefined) {
+    await writeClipboardText(previousClipboard).catch(() => undefined);
+  }
+
+  return selected;
+}
+
+async function getSelectedFinderItems(): Promise<Array<{ path: string }>> {
+  assertShimEnabled("enableAppleScript", "getSelectedFinderItems");
+  const result = await runAppleScript([
+    'tell application "Finder"',
+    "set selectedItems to selection",
+    "set output to \"\"",
+    "repeat with itemRef in selectedItems",
+    "set output to output & POSIX path of (itemRef as alias) & linefeed",
+    "end repeat",
+    "return output",
+    "end tell",
+  ].join("\n"));
+
+  return result
+    .split(/\r?\n/)
+    .map((path) => path.trim())
+    .filter(Boolean)
+    .map((path) => ({ path }));
+}
+
+async function getFrontmostApplication(): Promise<{ name: string }> {
+  assertShimEnabled("enableAppleScript", "getFrontmostApplication");
+  const name = await runAppleScript(
+    'tell application "System Events" to get name of first application process whose frontmost is true'
+  );
+  return { name };
+}
+
+async function launchCommand(options: unknown) {
+  assertShimEnabled("enableCommandLaunch", "launchCommand");
+  if (!options || typeof options !== "object") {
+    throw new Error("Raycast API launchCommand requires an options object");
+  }
+
+  const opts = options as Record<string, unknown>;
+  const commandName = typeof opts.name === "string" ? opts.name : "";
+  const extensionName =
+    typeof opts.extensionName === "string" ? opts.extensionName : currentExtension;
+  const owner = typeof opts.ownerOrAuthorName === "string" ? opts.ownerOrAuthorName : "";
+
+  if (!commandName || !extensionName || !owner) {
+    throw new Error(
+      "Raycast API launchCommand requires name, extensionName/current extension, and ownerOrAuthorName"
+    );
+  }
+
+  await runCommand("open", ["--", `raycast://extensions/${owner}/${extensionName}/${commandName}`]);
+}
+
+type AIAskResult = Promise<string> & EventEmitter;
+
+const AI_MODEL = createStringEnumProxy();
+
+const AI_CREATIVITY = {
+  None: "none",
+  Low: "low",
+  Medium: "medium",
+  High: "high",
+  Maximum: "maximum",
+  none: "none",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  maximum: "maximum",
+};
+
+function askAI(_prompt: string, _options?: unknown): AIAskResult {
+  const emitter = new EventEmitter();
+  const resultText = "";
+  const promise = Promise.resolve(resultText) as AIAskResult;
+  const eventMethods = [
+    "addListener",
+    "emit",
+    "eventNames",
+    "getMaxListeners",
+    "listenerCount",
+    "listeners",
+    "off",
+    "on",
+    "once",
+    "prependListener",
+    "prependOnceListener",
+    "rawListeners",
+    "removeAllListeners",
+    "removeListener",
+    "setMaxListeners",
+  ] as const;
+
+  for (const method of eventMethods) {
+    (promise as any)[method] = (emitter as any)[method].bind(emitter);
+  }
+
+  queueMicrotask(() => {
+    if (resultText) emitter.emit("data", resultText);
+    emitter.emit("end");
+  });
+
+  return promise;
+}
+
+/** AI - compatibility stub; RayBridge does not call or route LLMs */
 const AI = {
-  ask: async () => "",
-  model: createEnumProxy("model"),
+  ask: askAI,
+  Model: AI_MODEL,
+  model: AI_MODEL,
+  Creativity: AI_CREATIVITY,
 };
 
 // ============================================================================
@@ -303,6 +627,14 @@ const explicitExports: Record<string, unknown> = {
   // Clipboard and AI with explicit methods
   Clipboard,
   AI,
+  open,
+  showInFinder,
+  trash,
+  getSelectedText,
+  getSelectedFinderItems,
+  getFrontmostApplication,
+  launchCommand,
+  runAppleScript,
 
   // Toast with commonly-used Style enum
   Toast: {

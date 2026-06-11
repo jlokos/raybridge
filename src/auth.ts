@@ -1,10 +1,17 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, unlinkSync, mkdtempSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
 const RAYCAST_SALT = "yvkwWXzxPPBAqY2tmaKrB*DvYjjMaeEf";
+const SQLCIPHER_CANDIDATES = [
+  process.env.SQLCIPHER_BIN,
+  "/opt/homebrew/bin/sqlcipher",
+  "/usr/local/bin/sqlcipher",
+  "/opt/local/bin/sqlcipher",
+  "sqlcipher",
+].filter((value): value is string => Boolean(value));
 
 export interface TokenSet {
   accessToken: string;
@@ -42,7 +49,26 @@ function getDatabasePassphrase(): string {
  * Query Raycast's encrypted SQLite database using sqlcipher CLI.
  * Uses unique temp directory per query and includes retry logic for transient errors.
  */
+function resolveSqlcipherPath(): string {
+  for (const candidate of SQLCIPHER_CANDIDATES) {
+    try {
+      execFileSync(candidate, ["--version"], {
+        encoding: "utf-8",
+        stdio: "ignore",
+      });
+      return candidate;
+    } catch {
+      // Keep trying other candidates.
+    }
+  }
+
+  throw new Error(
+    "sqlcipher not found. Install it or set SQLCIPHER_BIN to the binary path."
+  );
+}
+
 function queryDB(passphrase: string, sql: string, retries = 3): any[] {
+  const sqlcipherPath = resolveSqlcipherPath();
   const dbDir = join(
     homedir(),
     "Library",
@@ -80,7 +106,7 @@ function queryDB(passphrase: string, sql: string, retries = 3): any[] {
       }
 
       const input = `PRAGMA key = '${passphrase}';\n.mode json\n${sql}`;
-      const result = execSync(`sqlcipher "${tmpDb}"`, {
+      const result = execFileSync(sqlcipherPath, [tmpDb], {
         input,
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,

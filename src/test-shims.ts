@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 /**
- * E2E test runner for RayBridge shims
+ * Test runner for RayBridge shims
  *
- * Loads each extension tool and executes it with realistic test inputs
- * derived from the tool's input schema. Verifies that tools return
- * actual output and don't fail due to missing shims.
+ * Loads each extension tool and checks it can import with the Raycast shims.
+ * The default mode does not execute tool functions, so verification cannot
+ * mutate local apps, call external APIs, or hang in extension-specific flows.
+ * Use --execute or RAYBRIDGE_SHIM_EXECUTE=1 to run live extension code.
  *
  * Outputs:
  * - Console: Visual ✅/❌ test results
@@ -13,7 +14,7 @@
  */
 
 import { discoverExtensions, type ToolEntry, type ExtensionEntry } from "./discovery.js";
-import { executeTool } from "./loader.js";
+import { executeTool, loadToolFunction } from "./loader.js";
 import { setPreferences, setRaycastTokens, installShims } from "./shims.js";
 import { loadRaycastTokens } from "./auth.js";
 import { readFile, appendFile, mkdir } from "node:fs/promises";
@@ -42,6 +43,14 @@ interface AuditEntry {
   missingShims: string[];
   duration: number;
 }
+
+const EXECUTE_TOOLS =
+  process.argv.includes("--execute") ||
+  process.env.RAYBRIDGE_SHIM_EXECUTE === "1";
+
+const TOOL_TIMEOUT = Number(
+  process.env.RAYBRIDGE_SHIM_TIMEOUT_MS || (EXECUTE_TOOLS ? 15000 : 5000)
+);
 
 // Extensions that get stuck in infinite loops (OAuth retry loops, etc.)
 const SKIP_EXTENSIONS = new Set([
@@ -182,14 +191,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-const TOOL_TIMEOUT = 15000;
-
 async function testTool(
   ext: ExtensionEntry,
   tool: ToolEntry
 ): Promise<TestResult> {
-  const toolId = `${ext.extensionName}/${tool.name}`;
-
   if (SKIP_EXTENSIONS.has(ext.extensionName)) {
     return { extension: ext.extensionName, tool: tool.name, status: "skip", error: "Problematic extension" };
   }
@@ -197,10 +202,22 @@ async function testTool(
   const input = generateTestInput(tool.inputSchema);
 
   try {
-    const result = await withTimeout(
-      executeTool(tool.jsPath, input, ext.extensionName, ext.extensionDir),
-      TOOL_TIMEOUT
-    );
+    let result: string | undefined;
+
+    if (EXECUTE_TOOLS) {
+      result = await withTimeout(
+        executeTool(tool.jsPath, input, ext.extensionName, ext.extensionDir),
+        TOOL_TIMEOUT
+      );
+    } else {
+      await withTimeout(
+        Promise.resolve(
+          loadToolFunction(tool.jsPath, ext.extensionName, ext.extensionDir)
+        ),
+        TOOL_TIMEOUT
+      );
+      result = "Loaded tool without executing it.";
+    }
 
     return {
       extension: ext.extensionName,
@@ -253,6 +270,11 @@ async function main() {
   console.log("\n┌─────────────────────────────────────────────────────────────┐");
   console.log("│              🔍 RayBridge Shim Test Suite                   │");
   console.log("└─────────────────────────────────────────────────────────────┘\n");
+  console.log(
+    EXECUTE_TOOLS
+      ? "Mode: live execution (--execute enabled)\n"
+      : "Mode: safe loadability check (use --execute to run live tools)\n"
+  );
 
   // Initialize
   const prefs = await loadPreferences();
